@@ -32,6 +32,30 @@ ruff check nanobot/ --select F401,F841  # CI lints this way
 
 **CI**: Runs on ubuntu with Python 3.11–3.13, installs via `uv sync --all-extras`, lints with `ruff`, runs `pytest tests/`.
 
+## Cloud Storage (COS)
+
+When `cloud_storage` is configured in `config.json`, nanobot uses COS (Tencent Cloud Object Storage) via S3-compatible API instead of local disk.
+
+Config example:
+```json
+{
+  "cloud_storage": {
+    "provider": "cos",
+    "endpoint_url": "https://cos.ap-beijing.myqcloud.com",
+    "bucket": "your-bucket",
+    "region": "ap-beijing",
+    "secret_id": "${COS_SECRET_ID}",
+    "secret_key": "${COS_SECRET_KEY}",
+    "prefix": "mclaw/"
+  }
+}
+```
+
+- All nanobot data (memory, sessions, tool results) is stored under the `prefix` path in the bucket
+- When `cloud_storage` is absent, nanobot uses local filesystem (default behavior)
+- GitStore version control is disabled in cloud mode
+- Storage interface is defined in `nanobot/providers/cloud_storage.py`
+
 ## Architecture
 
 ```
