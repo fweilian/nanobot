@@ -116,6 +116,12 @@ class ApiConfig(Base):
     timeout: float = 120.0  # Per-request timeout in seconds.
 
 
+class JWTConfig(Base):
+    """JWT 认证配置."""
+
+    secret: str = Field(default="", description="HS256 JWT 验签共享密钥")
+
+
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
@@ -194,6 +200,7 @@ class Config(BaseSettings):
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
+    jwt: JWTConfig | None = None
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
 
