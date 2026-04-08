@@ -1,4 +1,3 @@
-import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from nanobot.api.middleware import JWTAuthMiddleware
@@ -39,7 +38,7 @@ async def test_valid_token_sets_user_id():
         assert resp.status == 200
 
 
-async def test_missing_userId_returns_401():
+async def test_missing_user_id_returns_401():
     async def handler(request):
         return web.json_response({"ok": True})
 

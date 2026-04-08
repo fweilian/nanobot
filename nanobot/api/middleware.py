@@ -1,8 +1,8 @@
 """JWT 认证中间件，用于 aiohttp."""
 
-import jwt
 from aiohttp import web
 from typing import Callable, Awaitable
+import jwt
 
 
 class JWTAuthMiddleware:
@@ -32,8 +32,6 @@ class JWTAuthMiddleware:
             return _error(401, "Token expired")
         except jwt.DecodeError:
             return _error(401, "Invalid token")
-        except Exception:
-            return _error(401, "Unauthorized")
 
         user_id = payload.get("userId")
         if not user_id:
