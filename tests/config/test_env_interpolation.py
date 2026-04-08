@@ -54,23 +54,23 @@ class TestResolveConfig:
         config_path = tmp_path / "config.json"
         config_path.write_text(
             json.dumps(
-                {"providers": {"groq": {"apiKey": "${TEST_API_KEY}"}}}
+                {"providers": {"openai": {"apiKey": "${TEST_API_KEY}"}}}
             ),
             encoding="utf-8",
         )
 
         raw = load_config(config_path)
-        assert raw.providers.groq.api_key == "${TEST_API_KEY}"
+        assert raw.providers.openai.api_key == "${TEST_API_KEY}"
 
         resolved = resolve_config_env_vars(raw)
-        assert resolved.providers.groq.api_key == "resolved-key"
+        assert resolved.providers.openai.api_key == "resolved-key"
 
     def test_save_preserves_templates(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MY_TOKEN", "real-token")
         config_path = tmp_path / "config.json"
         config_path.write_text(
             json.dumps(
-                {"channels": {"telegram": {"token": "${MY_TOKEN}"}}}
+                {"channels": {"feishu": {"appId": "${MY_TOKEN}"}}}
             ),
             encoding="utf-8",
         )
@@ -79,4 +79,4 @@ class TestResolveConfig:
         save_config(raw, config_path)
 
         saved = json.loads(config_path.read_text(encoding="utf-8"))
-        assert saved["channels"]["telegram"]["token"] == "${MY_TOKEN}"
+        assert saved["channels"]["feishu"]["appId"] == "${MY_TOKEN}"

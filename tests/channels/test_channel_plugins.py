@@ -151,7 +151,8 @@ def test_discover_all_includes_external_plugin():
     assert result["line"] is _FakePlugin
 
 
-def test_discover_all_builtin_shadows_plugin():
+def test_discover_all_no_builtins_shadows_plugin():
+    """With no built-in channels, a plugin named 'telegram' is included directly."""
     from nanobot.channels.registry import discover_all
 
     ep = _make_entry_point("telegram", _FakeTelegram)
@@ -159,7 +160,7 @@ def test_discover_all_builtin_shadows_plugin():
         result = discover_all()
 
     assert "telegram" in result
-    assert result["telegram"] is not _FakeTelegram
+    assert result["telegram"] is _FakeTelegram
 
 
 # ---------------------------------------------------------------------------
