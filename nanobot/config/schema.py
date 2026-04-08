@@ -174,10 +174,23 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class CloudStorageConfig(Base):
+    """Cloud storage configuration for COS/S3-compatible backends."""
+
+    provider: str = "cos"  # "cos" or "s3"
+    endpoint_url: str = ""
+    bucket: str = ""
+    region: str = ""  # 保留字段，实际 endpoint_url 固定值
+    secret_id: str = ""
+    secret_key: str = ""
+    prefix: str = "mclaw/"  # 所有文件的公共前缀
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    cloud_storage: CloudStorageConfig | None = None
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
