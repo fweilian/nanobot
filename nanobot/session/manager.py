@@ -5,12 +5,16 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
-from nanobot.utils.helpers import ensure_dir, find_legal_message_start, safe_filename
+from nanobot.providers.cloud_storage import create_storage
+from nanobot.utils.helpers import find_legal_message_start, safe_filename
+
+if TYPE_CHECKING:
+    from nanobot.config.schema import CloudStorageConfig
 
 
 @dataclass
@@ -97,24 +101,43 @@ class SessionManager:
     """
     Manages conversation sessions.
 
-    Sessions are stored as JSONL files in the sessions directory.
+    Sessions are stored via CloudStorage.
     """
 
-    def __init__(self, workspace: Path):
+    def __init__(
+        self,
+        workspace: Path,
+        cloud_config: "CloudStorageConfig | None" = None,
+    ):
         self.workspace = workspace
-        self.sessions_dir = ensure_dir(self.workspace / "sessions")
+        self._storage = create_storage(cloud_config, workspace)
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
 
-    def _get_session_path(self, key: str) -> Path:
-        """Get the file path for a session."""
+    def _get_session_key(self, key: str) -> str:
+        """Get the storage key for a session."""
         safe_key = safe_filename(key.replace(":", "_"))
-        return self.sessions_dir / f"{safe_key}.jsonl"
+        return f"sessions/{safe_key}.jsonl"
 
     def _get_legacy_session_path(self, key: str) -> Path:
         """Legacy global session path (~/.nanobot/sessions/)."""
         safe_key = safe_filename(key.replace(":", "_"))
         return self.legacy_sessions_dir / f"{safe_key}.jsonl"
+
+    def _read_session_bytes(self, key: str) -> bytes | None:
+        """Read session bytes from storage, return None if not found."""
+        try:
+            return self._storage.read(self._get_session_key(key))
+        except FileNotFoundError:
+            return None
+
+    def _write_session_bytes(self, key: str, data: bytes) -> None:
+        """Write session bytes to storage."""
+        self._storage.write(self._get_session_key(key), data)
+
+    def _session_exists(self, key: str) -> bool:
+        """Check if session exists in storage."""
+        return self._storage.exists(self._get_session_key(key))
 
     def get_or_create(self, key: str) -> Session:
         """
@@ -137,18 +160,18 @@ class SessionManager:
         return session
 
     def _load(self, key: str) -> Session | None:
-        """Load a session from disk."""
-        path = self._get_session_path(key)
-        if not path.exists():
-            legacy_path = self._get_legacy_session_path(key)
-            if legacy_path.exists():
-                try:
-                    shutil.move(str(legacy_path), str(path))
-                    logger.info("Migrated session {} from legacy path", key)
-                except Exception:
-                    logger.exception("Failed to migrate session {}", key)
+        """Load a session from storage."""
+        # Check legacy path first (local migration only)
+        legacy_path = self._get_legacy_session_path(key)
+        if legacy_path.exists():
+            try:
+                shutil.move(str(legacy_path), str(self.workspace / self._get_session_key(key)))
+                logger.info("Migrated session {} from legacy path", key)
+            except Exception:
+                logger.exception("Failed to migrate session {}", key)
 
-        if not path.exists():
+        data = self._read_session_bytes(key)
+        if data is None:
             return None
 
         try:
@@ -157,20 +180,20 @@ class SessionManager:
             created_at = None
             last_consolidated = 0
 
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
+            lines = data.decode("utf-8").split("\n")
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
 
-                    data = json.loads(line)
+                obj = json.loads(line)
 
-                    if data.get("_type") == "metadata":
-                        metadata = data.get("metadata", {})
-                        created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
-                        last_consolidated = data.get("last_consolidated", 0)
-                    else:
-                        messages.append(data)
+                if obj.get("_type") == "metadata":
+                    metadata = obj.get("metadata", {})
+                    created_at = datetime.fromisoformat(obj["created_at"]) if obj.get("created_at") else None
+                    last_consolidated = obj.get("last_consolidated", 0)
+                else:
+                    messages.append(obj)
 
             return Session(
                 key=key,
@@ -184,22 +207,20 @@ class SessionManager:
             return None
 
     def save(self, session: Session) -> None:
-        """Save a session to disk."""
-        path = self._get_session_path(session.key)
-
-        with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
-            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
-
+        """Save a session to storage."""
+        metadata_line = {
+            "_type": "metadata",
+            "key": session.key,
+            "created_at": session.created_at.isoformat(),
+            "updated_at": session.updated_at.isoformat(),
+            "metadata": session.metadata,
+            "last_consolidated": session.last_consolidated
+        }
+        lines = [json.dumps(metadata_line, ensure_ascii=False) + "\n"]
+        for msg in session.messages:
+            lines.append(json.dumps(msg, ensure_ascii=False) + "\n")
+        data = "".join(lines).encode("utf-8")
+        self._write_session_bytes(session.key, data)
         self._cache[session.key] = session
 
     def invalidate(self, key: str) -> None:
@@ -214,22 +235,30 @@ class SessionManager:
             List of session info dicts.
         """
         sessions = []
+        try:
+            keys = self._storage.list("sessions/")
+        except Exception:
+            return []
 
-        for path in self.sessions_dir.glob("*.jsonl"):
+        for key in keys:
+            if not key.endswith(".jsonl"):
+                continue
             try:
-                # Read just the metadata line
-                with open(path, encoding="utf-8") as f:
-                    first_line = f.readline().strip()
-                    if first_line:
-                        data = json.loads(first_line)
-                        if data.get("_type") == "metadata":
-                            key = data.get("key") or path.stem.replace("_", ":", 1)
-                            sessions.append({
-                                "key": key,
-                                "created_at": data.get("created_at"),
-                                "updated_at": data.get("updated_at"),
-                                "path": str(path)
-                            })
+                data = self._storage.read(f"sessions/{key}")
+                if not data:
+                    continue
+                lines = data.decode("utf-8").split("\n")
+                first_line = lines[0].strip() if lines else ""
+                if first_line:
+                    obj = json.loads(first_line)
+                    if obj.get("_type") == "metadata":
+                        safe_key = key.replace(".jsonl", "")
+                        sessions.append({
+                            "key": obj.get("key") or safe_key.replace("_", ":", 1),
+                            "created_at": obj.get("created_at"),
+                            "updated_at": obj.get("updated_at"),
+                            "path": key
+                        })
             except Exception:
                 continue
 
