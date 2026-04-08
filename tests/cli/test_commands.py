@@ -317,7 +317,7 @@ def test_agent_config_sets_active_path(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
     monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
     monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
-    monkeypatch.setattr("nanobot.cron.service.CronService", lambda _store: object())
+    monkeypatch.setattr("nanobot.cron.service.CronService", lambda _store, cloud_config=None: object())
 
     class _FakeAgentLoop:
         def __init__(self, *args, **kwargs) -> None:
@@ -354,7 +354,7 @@ def test_agent_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: Pa
     monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
 
     class _FakeCron:
-        def __init__(self, store_path: Path) -> None:
+        def __init__(self, store_path: Path, cloud_config=None) -> None:
             seen["cron_store"] = store_path
 
     class _FakeAgentLoop:
@@ -401,7 +401,7 @@ def test_agent_workspace_override_does_not_migrate_legacy_cron(
     monkeypatch.setattr("nanobot.config.paths.get_cron_dir", lambda: legacy_dir)
 
     class _FakeCron:
-        def __init__(self, store_path: Path) -> None:
+        def __init__(self, store_path: Path, cloud_config=None) -> None:
             seen["cron_store"] = store_path
 
     class _FakeAgentLoop:
@@ -454,7 +454,7 @@ def test_agent_custom_config_workspace_does_not_migrate_legacy_cron(
     monkeypatch.setattr("nanobot.config.paths.get_cron_dir", lambda: legacy_dir)
 
     class _FakeCron:
-        def __init__(self, store_path: Path) -> None:
+        def __init__(self, store_path: Path, cloud_config=None) -> None:
             seen["cron_store"] = store_path
 
     class _FakeAgentLoop:
@@ -666,7 +666,7 @@ def test_gateway_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: 
     seen: dict[str, Path] = {}
 
     class _StopCron:
-        def __init__(self, store_path: Path) -> None:
+        def __init__(self, store_path: Path, cloud_config=None) -> None:
             seen["cron_store"] = store_path
             raise _StopGatewayError("stop")
 
@@ -706,7 +706,7 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
     monkeypatch.setattr("nanobot.session.manager.SessionManager", lambda _workspace, cloud_config=None: object())
 
     class _FakeCron:
-        def __init__(self, _store_path: Path) -> None:
+        def __init__(self, _store_path: Path, cloud_config=None) -> None:
             self.on_job = None
             seen["cron"] = self
 
@@ -807,7 +807,7 @@ def test_gateway_workspace_override_does_not_migrate_legacy_cron(
     seen: dict[str, Path] = {}
 
     class _StopCron:
-        def __init__(self, store_path: Path) -> None:
+        def __init__(self, store_path: Path, cloud_config=None) -> None:
             seen["cron_store"] = store_path
             raise _StopGatewayError("stop")
 
@@ -846,7 +846,7 @@ def test_gateway_custom_config_workspace_does_not_migrate_legacy_cron(
     seen: dict[str, Path] = {}
 
     class _StopCron:
-        def __init__(self, store_path: Path) -> None:
+        def __init__(self, store_path: Path, cloud_config=None) -> None:
             seen["cron_store"] = store_path
             raise _StopGatewayError("stop")
 

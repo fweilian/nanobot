@@ -6,11 +6,14 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Literal
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Literal
 
 from loguru import logger
 
 from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronRunRecord, CronSchedule, CronStore
+
+if TYPE_CHECKING:
+    from nanobot.config.schema import CloudStorageConfig
 
 
 def _now_ms() -> int:
@@ -69,6 +72,7 @@ class CronService:
         self,
         store_path: Path,
         on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
+        cloud_config: "CloudStorageConfig | None" = None,
     ):
         self.store_path = store_path
         self.on_job = on_job
@@ -76,20 +80,30 @@ class CronService:
         self._last_mtime: float = 0.0
         self._timer_task: asyncio.Task | None = None
         self._running = False
+        # Cloud storage for cron jobs persistence
+        workspace = store_path.parent.parent  # store_path = workspace/cron/jobs.json
+        from nanobot.providers.cloud_storage import create_storage
+        self._storage = create_storage(cloud_config, workspace)
+        self._cron_key = "cron/jobs.json"
 
     def _load_store(self) -> CronStore:
-        """Load jobs from disk. Reloads automatically if file was modified externally."""
-        if self._store and self.store_path.exists():
-            mtime = self.store_path.stat().st_mtime
-            if mtime != self._last_mtime:
-                logger.info("Cron: jobs.json modified externally, reloading")
-                self._store = None
+        """Load jobs from storage. Reloads automatically if file was modified externally (local only)."""
+        if self._store:
+            # Cloud storage doesn't have mtime-based reload detection
+            if self._storage.__class__.__name__ == "LocalStorage":
+                if self.store_path.exists():
+                    mtime = self.store_path.stat().st_mtime
+                    if mtime != self._last_mtime:
+                        logger.info("Cron: jobs.json modified externally, reloading")
+                        self._store = None
+            else:
+                return self._store
         if self._store:
             return self._store
 
-        if self.store_path.exists():
+        if self._storage.exists(self._cron_key):
             try:
-                data = json.loads(self.store_path.read_text(encoding="utf-8"))
+                data = json.loads(self._storage.read(self._cron_key).decode("utf-8"))
                 jobs = []
                 for j in data.get("jobs", []):
                     jobs.append(CronJob(
@@ -130,7 +144,8 @@ class CronService:
                         delete_after_run=j.get("deleteAfterRun", False),
                     ))
                 self._store = CronStore(jobs=jobs)
-                self._last_mtime = self.store_path.stat().st_mtime
+                if self._storage.__class__.__name__ == "LocalStorage":
+                    self._last_mtime = self.store_path.stat().st_mtime
             except Exception as e:
                 logger.warning("Failed to load cron store: {}", e)
                 self._store = CronStore()
@@ -140,11 +155,9 @@ class CronService:
         return self._store
 
     def _save_store(self) -> None:
-        """Save jobs to disk."""
+        """Save jobs to storage."""
         if not self._store:
             return
-
-        self.store_path.parent.mkdir(parents=True, exist_ok=True)
 
         data = {
             "version": self._store.version,
@@ -190,7 +203,10 @@ class CronService:
             ]
         }
 
-        self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        if self._storage.__class__.__name__ == "LocalStorage":
+            self.store_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._storage.write(self._cron_key, json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8"))
 
     async def start(self) -> None:
         """Start the cron service."""

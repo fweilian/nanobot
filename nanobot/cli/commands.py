@@ -647,7 +647,7 @@ def gateway(
 
     # Create cron service with workspace-scoped store
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
-    cron = CronService(cron_store_path)
+    cron = CronService(cron_store_path, cloud_config=config.cloud_storage)
 
     # Create agent with cron service
     agent = AgentLoop(
@@ -898,7 +898,7 @@ def agent(
 
     # Create cron service with workspace-scoped store
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
-    cron = CronService(cron_store_path)
+    cron = CronService(cron_store_path, cloud_config=config.cloud_storage)
 
     if logs:
         logger.enable("nanobot")
