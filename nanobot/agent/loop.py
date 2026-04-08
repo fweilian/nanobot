@@ -28,6 +28,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+from nanobot.utils.user_context import clear_current_user_id, set_current_user_id
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMProvider
@@ -455,6 +456,7 @@ class AgentLoop:
         gate = self._concurrency_gate or nullcontext()
         async with lock, gate:
             try:
+                set_current_user_id(msg.sender_id)
                 on_stream = on_stream_end = None
                 if msg.metadata.get("_wants_stream"):
                     # Split one answer into distinct stream segments.
@@ -521,6 +523,8 @@ class AgentLoop:
                         content="Sorry, I encountered an error.",
                     )
                 )
+            finally:
+                clear_current_user_id()
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
