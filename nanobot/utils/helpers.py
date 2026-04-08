@@ -8,10 +8,24 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import tiktoken
 from loguru import logger
+
+if TYPE_CHECKING:
+    from nanobot.providers.cloud_storage import CloudStorage
+
+# Cloud storage instance for tool result persistence
+_storage: "CloudStorage | None" = None
+
+def set_storage(storage: "CloudStorage | None") -> None:
+    """Called during nanobot init to provide CloudStorage for helpers."""
+    global _storage
+    _storage = storage
+
+def get_storage() -> "CloudStorage | None":
+    return _storage
 
 
 def strip_think(text: str) -> str:
@@ -211,26 +225,47 @@ def maybe_persist_tool_result(
     if len(text_payload) <= max_chars:
         return content
 
-    root = ensure_dir(workspace / _TOOL_RESULTS_DIR)
-    bucket = ensure_dir(root / safe_filename(session_key or "default"))
-    try:
-        _cleanup_tool_result_buckets(root, bucket)
-    except Exception as exc:
-        logger.warning("Failed to clean stale tool result buckets in {}: {}", root, exc)
-    path = bucket / f"{safe_filename(tool_call_id)}.{suffix}"
-    if not path.exists():
-        if suffix == "json" and isinstance(content, list):
-            _write_text_atomic(path, json.dumps(content, ensure_ascii=False, indent=2))
-        else:
-            _write_text_atomic(path, text_payload)
+    # Determine storage key
+    storage_key = f"{_TOOL_RESULTS_DIR}/{safe_filename(session_key or 'default')}/{safe_filename(tool_call_id)}.{suffix}"
 
-    preview = text_payload[:_TOOL_RESULT_PREVIEW_CHARS]
-    return _render_tool_result_reference(
-        path,
-        original_size=len(text_payload),
-        preview=preview,
-        truncated_preview=len(text_payload) > _TOOL_RESULT_PREVIEW_CHARS,
-    )
+    # Prepare content bytes
+    if suffix == "json" and isinstance(content, list):
+        content_bytes = json.dumps(content, ensure_ascii=False, indent=2).encode("utf-8")
+    else:
+        content_bytes = text_payload.encode("utf-8")
+
+    # Use storage if available, otherwise fall back to local file
+    if _storage is not None:
+        _storage.write(storage_key, content_bytes)
+        preview = text_payload[:_TOOL_RESULT_PREVIEW_CHARS]
+        return _render_tool_result_reference(
+            storage_key,
+            original_size=len(text_payload),
+            preview=preview,
+            truncated_preview=len(text_payload) > _TOOL_RESULT_PREVIEW_CHARS,
+        )
+    else:
+        # Local file fallback
+        root = ensure_dir(workspace / _TOOL_RESULTS_DIR)
+        bucket = ensure_dir(root / safe_filename(session_key or "default"))
+        try:
+            _cleanup_tool_result_buckets(root, bucket)
+        except Exception as exc:
+            logger.warning("Failed to clean stale tool result buckets in {}: {}", root, exc)
+        path = bucket / f"{safe_filename(tool_call_id)}.{suffix}"
+        if not path.exists():
+            if suffix == "json" and isinstance(content, list):
+                _write_text_atomic(path, json.dumps(content, ensure_ascii=False, indent=2))
+            else:
+                _write_text_atomic(path, text_payload)
+
+        preview = text_payload[:_TOOL_RESULT_PREVIEW_CHARS]
+        return _render_tool_result_reference(
+            path,
+            original_size=len(text_payload),
+            preview=preview,
+            truncated_preview=len(text_payload) > _TOOL_RESULT_PREVIEW_CHARS,
+        )
 
 
 def split_message(content: str, max_len: int = 2000) -> list[str]:
