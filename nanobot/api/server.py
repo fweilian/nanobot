@@ -14,6 +14,7 @@ from typing import Any
 from aiohttp import web
 from loguru import logger
 
+from nanobot.api.middleware import JWTAuthMiddleware
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 API_SESSION_KEY = "api:default"
@@ -101,6 +102,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     logger.info("API request session_key={} content={}", session_key, user_content[:80])
 
     _FALLBACK = EMPTY_FINAL_RESPONSE_MESSAGE
+    sender_id = request.get("user_id", "anonymous")
 
     try:
         async with session_lock:
@@ -111,6 +113,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         session_key=session_key,
                         channel="api",
                         chat_id=API_CHAT_ID,
+                        sender_id=sender_id,
                     ),
                     timeout=timeout_s,
                 )
@@ -127,6 +130,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             session_key=session_key,
                             channel="api",
                             chat_id=API_CHAT_ID,
+                            sender_id=sender_id,
                         ),
                         timeout=timeout_s,
                     )
@@ -175,7 +179,7 @@ async def handle_health(request: web.Request) -> web.Response:
 # App factory
 # ---------------------------------------------------------------------------
 
-def create_app(agent_loop, model_name: str = "nanobot", request_timeout: float = 120.0) -> web.Application:
+def create_app(agent_loop, *, jwt_secret: str = "", model_name: str = "nanobot", request_timeout: float = 120.0) -> web.Application:
     """Create the aiohttp application.
 
     Args:
@@ -188,6 +192,8 @@ def create_app(agent_loop, model_name: str = "nanobot", request_timeout: float =
     app["model_name"] = model_name
     app["request_timeout"] = request_timeout
     app["session_locks"] = {}  # per-user locks, keyed by session_key
+    if jwt_secret:
+        app.middlewares.append(JWTAuthMiddleware(jwt_secret))
 
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
     app.router.add_get("/v1/models", handle_models)
