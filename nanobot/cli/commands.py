@@ -526,6 +526,7 @@ def serve(
         raise typer.Exit(1)
 
     from loguru import logger
+
     from nanobot.agent.loop import AgentLoop
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
@@ -583,7 +584,7 @@ def serve(
     if not jwt_secret:
         console.print("[red]Error:[/red] JWT secret is required for API server. Set 'jwt.secret' in config.")
         raise typer.Exit(1)
-    console.print(f"  [cyan]JWT[/cyan]     : enabled")
+    console.print("  [cyan]JWT[/cyan]     : enabled")
     if host in {"0.0.0.0", "::"}:
         console.print(
             "[yellow]Warning:[/yellow] API is bound to all interfaces. "

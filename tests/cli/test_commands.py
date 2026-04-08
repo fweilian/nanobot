@@ -12,7 +12,6 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.cli.commands import _make_provider, app
 from nanobot.config.schema import Config, JWTConfig
 from nanobot.cron.types import CronJob, CronPayload
-from nanobot.providers.registry import find_by_name
 
 runner = CliRunner()
 
