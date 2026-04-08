@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.cli.commands import _make_provider, app
-from nanobot.config.schema import Config
+from nanobot.config.schema import Config, JWTConfig
 from nanobot.cron.types import CronJob, CronPayload
 from nanobot.providers.registry import find_by_name
 
@@ -592,8 +592,9 @@ def _patch_serve_runtime(monkeypatch, config: Config, seen: dict[str, object]) -
         async def close_mcp(self) -> None:
             return None
 
-    def _fake_create_app(agent_loop, model_name: str, request_timeout: float):
+    def _fake_create_app(agent_loop, *, jwt_secret: str = "", model_name: str = "nanobot", request_timeout: float = 120.0):
         seen["agent_loop"] = agent_loop
+        seen["jwt_secret"] = jwt_secret
         seen["model_name"] = model_name
         seen["request_timeout"] = request_timeout
         return _FakeApiApp()
@@ -951,6 +952,7 @@ def test_serve_uses_api_config_defaults_and_workspace_override(
     config.api.host = "127.0.0.2"
     config.api.port = 18900
     config.api.timeout = 45.0
+    config.jwt = JWTConfig(secret="test-secret")
     override_workspace = tmp_path / "override-workspace"
     seen: dict[str, object] = {}
 
@@ -966,6 +968,7 @@ def test_serve_uses_api_config_defaults_and_workspace_override(
     assert seen["host"] == "127.0.0.2"
     assert seen["port"] == 18900
     assert seen["request_timeout"] == 45.0
+    assert seen["jwt_secret"] == "test-secret"
 
 
 def test_serve_cli_options_override_api_config(monkeypatch, tmp_path: Path) -> None:
@@ -974,6 +977,7 @@ def test_serve_cli_options_override_api_config(monkeypatch, tmp_path: Path) -> N
     config.api.host = "127.0.0.2"
     config.api.port = 18900
     config.api.timeout = 45.0
+    config.jwt = JWTConfig(secret="test-secret")
     seen: dict[str, object] = {}
 
     _patch_serve_runtime(monkeypatch, config, seen)
@@ -997,6 +1001,7 @@ def test_serve_cli_options_override_api_config(monkeypatch, tmp_path: Path) -> N
     assert seen["host"] == "127.0.0.1"
     assert seen["port"] == 18901
     assert seen["request_timeout"] == 46.0
+    assert seen["jwt_secret"] == "test-secret"
 
 
 def test_channels_login_requires_channel_name() -> None:
