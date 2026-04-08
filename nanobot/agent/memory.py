@@ -12,14 +12,15 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
-from nanobot.utils.prompt_templates import render_template
-from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, strip_think
-
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.providers.cloud_storage import create_storage
 from nanobot.utils.gitstore import GitStore
+from nanobot.utils.helpers import estimate_message_tokens, estimate_prompt_tokens_chain, strip_think
+from nanobot.utils.prompt_templates import render_template
 
 if TYPE_CHECKING:
+    from nanobot.config.schema import CloudStorageConfig
     from nanobot.providers.base import LLMProvider
     from nanobot.session.manager import Session, SessionManager
 
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # MemoryStore — pure file I/O layer
 # ---------------------------------------------------------------------------
+
 
 class MemoryStore:
     """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md."""
@@ -38,25 +40,77 @@ class MemoryStore:
         r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s+[A-Z][A-Z0-9_]*(?:\s+\[tools:\s*[^\]]+\])?:"
     )
 
-    def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
+    def __init__(
+        self,
+        workspace: Path,
+        cloud_config: "CloudStorageConfig | None" = None,
+        max_history_entries: int = _DEFAULT_MAX_HISTORY,
+    ):
         self.workspace = workspace
+        self._storage = create_storage(cloud_config, workspace)
         self.max_history_entries = max_history_entries
-        self.memory_dir = ensure_dir(workspace / "memory")
-        self.memory_file = self.memory_dir / "MEMORY.md"
-        self.history_file = self.memory_dir / "history.jsonl"
-        self.legacy_history_file = self.memory_dir / "HISTORY.md"
-        self.soul_file = workspace / "SOUL.md"
-        self.user_file = workspace / "USER.md"
-        self._cursor_file = self.memory_dir / ".cursor"
-        self._dream_cursor_file = self.memory_dir / ".dream_cursor"
-        self._git = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "memory/MEMORY.md",
-        ])
+        self._git = GitStore(
+            workspace,
+            tracked_files=[
+                "SOUL.md",
+                "USER.md",
+                "memory/MEMORY.md",
+            ],
+            enabled=(cloud_config is None),
+        )
         self._maybe_migrate_legacy_history()
 
     @property
     def git(self) -> GitStore:
         return self._git
+
+    # -- storage key properties -----------------------------------------------
+
+    @property
+    def _memory_dir_key(self) -> str:
+        return "memory"
+
+    @property
+    def _memory_file_key(self) -> str:
+        return "memory/MEMORY.md"
+
+    @property
+    def _history_file_key(self) -> str:
+        return "memory/history.jsonl"
+
+    @property
+    def _legacy_history_file_key(self) -> str:
+        return "memory/HISTORY.md"
+
+    @property
+    def _soul_file_key(self) -> str:
+        return "SOUL.md"
+
+    @property
+    def _user_file_key(self) -> str:
+        return "USER.md"
+
+    @property
+    def _cursor_file_key(self) -> str:
+        return "memory/.cursor"
+
+    @property
+    def _dream_cursor_file_key(self) -> str:
+        return "memory/.dream_cursor"
+
+    # -- storage helpers -------------------------------------------------------
+
+    def _read_bytes(self, key: str) -> bytes:
+        try:
+            return self._storage.read(key)
+        except FileNotFoundError:
+            return b""
+
+    def _write_bytes(self, key: str, data: bytes) -> None:
+        self._storage.write(key, data)
+
+    def _exists(self, key: str) -> bool:
+        return self._storage.exists(key)
 
     # -- generic helpers -----------------------------------------------------
 
@@ -71,17 +125,22 @@ class MemoryStore:
         """One-time upgrade from legacy HISTORY.md to history.jsonl.
 
         The migration is best-effort and prioritizes preserving as much content
-        as possible over perfect parsing.
+        as possible over perfect parsing. Only runs in local storage mode.
         """
-        if not self.legacy_history_file.exists():
+        if not self._exists(self._legacy_history_file_key):
             return
-        if self.history_file.exists() and self.history_file.stat().st_size > 0:
-            return
+        if self._exists(self._history_file_key):
+            # Check if history file has content
+            try:
+                content = self._read_bytes(self._history_file_key)
+                if content:
+                    return
+            except FileNotFoundError:
+                pass
 
         try:
-            legacy_text = self.legacy_history_file.read_text(
-                encoding="utf-8",
-                errors="replace",
+            legacy_text = self._read_bytes(self._legacy_history_file_key).decode(
+                "utf-8", errors="replace"
             )
         except OSError:
             logger.exception("Failed to read legacy HISTORY.md for migration")
@@ -92,13 +151,18 @@ class MemoryStore:
             if entries:
                 self._write_entries(entries)
                 last_cursor = entries[-1]["cursor"]
-                self._cursor_file.write_text(str(last_cursor), encoding="utf-8")
+                self._write_bytes(self._cursor_file_key, str(last_cursor).encode("utf-8"))
                 # Default to "already processed" so upgrades do not replay the
                 # user's entire historical archive into Dream on first start.
-                self._dream_cursor_file.write_text(str(last_cursor), encoding="utf-8")
+                self._write_bytes(self._dream_cursor_file_key, str(last_cursor).encode("utf-8"))
 
-            backup_path = self._next_legacy_backup_path()
-            self.legacy_history_file.replace(backup_path)
+            # Only do local filesystem backup when using LocalStorage
+            from nanobot.providers.cloud_storage import LocalStorage
+
+            if isinstance(self._storage, LocalStorage):
+                source_path = Path(self.workspace) / self._legacy_history_file_key
+                backup_path = self._next_legacy_backup_path()
+                source_path.replace(backup_path)
             logger.info(
                 "Migrated legacy HISTORY.md to history.jsonl ({} entries)",
                 len(entries),
@@ -121,15 +185,17 @@ class MemoryStore:
             match = self._LEGACY_TIMESTAMP_RE.match(chunk)
             if match:
                 timestamp = match.group(1)
-                remainder = chunk[match.end():].lstrip()
+                remainder = chunk[match.end() :].lstrip()
                 if remainder:
                     content = remainder
 
-            entries.append({
-                "cursor": cursor,
-                "timestamp": timestamp,
-                "content": content,
-            })
+            entries.append(
+                {
+                    "cursor": cursor,
+                    "timestamp": timestamp,
+                    "content": content,
+                }
+            )
         return entries
 
     def _split_legacy_history_chunks(self, text: str) -> list[str]:
@@ -170,47 +236,38 @@ class MemoryStore:
         match = self._LEGACY_TIMESTAMP_RE.match(first_nonempty)
         if not match:
             return False
-        return first_nonempty[match.end():].lstrip().startswith("[RAW]")
+        return first_nonempty[match.end() :].lstrip().startswith("[RAW]")
 
     def _legacy_fallback_timestamp(self) -> str:
-        try:
-            return datetime.fromtimestamp(
-                self.legacy_history_file.stat().st_mtime,
-            ).strftime("%Y-%m-%d %H:%M")
-        except OSError:
-            return datetime.now().strftime("%Y-%m-%d %H:%M")
+        return datetime.now().strftime("%Y-%m-%d %H:%M")
 
     def _next_legacy_backup_path(self) -> Path:
-        candidate = self.memory_dir / "HISTORY.md.bak"
-        suffix = 2
-        while candidate.exists():
-            candidate = self.memory_dir / f"HISTORY.md.bak.{suffix}"
-            suffix += 1
-        return candidate
+        # Only used for legacy migration which is local-only
+        return self.workspace / (self._legacy_history_file_key + ".bak")
 
     # -- MEMORY.md (long-term facts) -----------------------------------------
 
     def read_memory(self) -> str:
-        return self.read_file(self.memory_file)
+        return self._read_bytes(self._memory_file_key).decode("utf-8", errors="replace")
 
     def write_memory(self, content: str) -> None:
-        self.memory_file.write_text(content, encoding="utf-8")
+        self._write_bytes(self._memory_file_key, content.encode("utf-8"))
 
     # -- SOUL.md -------------------------------------------------------------
 
     def read_soul(self) -> str:
-        return self.read_file(self.soul_file)
+        return self._read_bytes(self._soul_file_key).decode("utf-8", errors="replace")
 
     def write_soul(self, content: str) -> None:
-        self.soul_file.write_text(content, encoding="utf-8")
+        self._write_bytes(self._soul_file_key, content.encode("utf-8"))
 
     # -- USER.md -------------------------------------------------------------
 
     def read_user(self) -> str:
-        return self.read_file(self.user_file)
+        return self._read_bytes(self._user_file_key).decode("utf-8", errors="replace")
 
     def write_user(self, content: str) -> None:
-        self.user_file.write_text(content, encoding="utf-8")
+        self._write_bytes(self._user_file_key, content.encode("utf-8"))
 
     # -- context injection (used by context.py) ------------------------------
 
@@ -224,17 +281,26 @@ class MemoryStore:
         """Append *entry* to history.jsonl and return its auto-incrementing cursor."""
         cursor = self._next_cursor()
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        record = {"cursor": cursor, "timestamp": ts, "content": strip_think(entry.rstrip()) or entry.rstrip()}
-        with open(self.history_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        self._cursor_file.write_text(str(cursor), encoding="utf-8")
+        record = {
+            "cursor": cursor,
+            "timestamp": ts,
+            "content": strip_think(entry.rstrip()) or entry.rstrip(),
+        }
+        entry_line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        # Append to existing content
+        try:
+            existing = self._storage.read(self._history_file_key)
+        except FileNotFoundError:
+            existing = b""
+        self._write_bytes(self._history_file_key, existing + entry_line)
+        self._write_bytes(self._cursor_file_key, str(cursor).encode("utf-8"))
         return cursor
 
     def _next_cursor(self) -> int:
         """Read the current cursor counter and return next value."""
-        if self._cursor_file.exists():
+        if self._exists(self._cursor_file_key):
             try:
-                return int(self._cursor_file.read_text(encoding="utf-8").strip()) + 1
+                return int(self._read_bytes(self._cursor_file_key).decode("utf-8").strip()) + 1
             except (ValueError, OSError):
                 pass
         # Fallback: read last line's cursor from the JSONL file.
@@ -254,7 +320,7 @@ class MemoryStore:
         entries = self._read_entries()
         if len(entries) <= self.max_history_entries:
             return
-        kept = entries[-self.max_history_entries:]
+        kept = entries[-self.max_history_entries :]
         self._write_entries(kept)
 
     # -- JSONL helpers -------------------------------------------------------
@@ -263,14 +329,14 @@ class MemoryStore:
         """Read all entries from history.jsonl."""
         entries: list[dict[str, Any]] = []
         try:
-            with open(self.history_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            entries.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            continue
+            data = self._read_bytes(self._history_file_key).decode("utf-8")
+            for line in data.split("\n"):
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
         except FileNotFoundError:
             pass
         return entries
@@ -278,39 +344,31 @@ class MemoryStore:
     def _read_last_entry(self) -> dict[str, Any] | None:
         """Read the last entry from the JSONL file efficiently."""
         try:
-            with open(self.history_file, "rb") as f:
-                f.seek(0, 2)
-                size = f.tell()
-                if size == 0:
-                    return None
-                read_size = min(size, 4096)
-                f.seek(size - read_size)
-                data = f.read().decode("utf-8")
-                lines = [l for l in data.split("\n") if l.strip()]
-                if not lines:
-                    return None
-                return json.loads(lines[-1])
+            data = self._read_bytes(self._history_file_key).decode("utf-8")
+            lines = [line for line in data.split("\n") if line.strip()]
+            if not lines:
+                return None
+            return json.loads(lines[-1])
         except (FileNotFoundError, json.JSONDecodeError):
             return None
 
     def _write_entries(self, entries: list[dict[str, Any]]) -> None:
         """Overwrite history.jsonl with the given entries."""
-        with open(self.history_file, "w", encoding="utf-8") as f:
-            for entry in entries:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        data = b"".join(
+            (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8") for entry in entries
+        )
+        self._write_bytes(self._history_file_key, data)
 
     # -- dream cursor --------------------------------------------------------
 
     def get_last_dream_cursor(self) -> int:
-        if self._dream_cursor_file.exists():
-            try:
-                return int(self._dream_cursor_file.read_text(encoding="utf-8").strip())
-            except (ValueError, OSError):
-                pass
-        return 0
+        try:
+            return int(self._read_bytes(self._dream_cursor_file_key).decode("utf-8").strip())
+        except (FileNotFoundError, ValueError):
+            return 0
 
     def set_last_dream_cursor(self, cursor: int) -> None:
-        self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
+        self._write_bytes(self._dream_cursor_file_key, str(cursor).encode("utf-8"))
 
     # -- message formatting utility ------------------------------------------
 
@@ -320,7 +378,9 @@ class MemoryStore:
         for message in messages:
             if not message.get("content"):
                 continue
-            tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
+            tools = (
+                f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
+            )
             lines.append(
                 f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}{tools}: {message['content']}"
             )
@@ -328,14 +388,8 @@ class MemoryStore:
 
     def raw_archive(self, messages: list[dict]) -> None:
         """Fallback: dump raw messages to history.jsonl without LLM summarization."""
-        self.append_history(
-            f"[RAW] {len(messages)} messages\n"
-            f"{self._format_messages(messages)}"
-        )
-        logger.warning(
-            "Memory consolidation degraded: raw-archived {} messages", len(messages)
-        )
-
+        self.append_history(f"[RAW] {len(messages)} messages\n{self._format_messages(messages)}")
+        logger.warning("Memory consolidation degraded: raw-archived {} messages", len(messages))
 
 
 # ---------------------------------------------------------------------------
@@ -369,9 +423,7 @@ class Consolidator:
         self.max_completion_tokens = max_completion_tokens
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
-        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
-            weakref.WeakValueDictionary()
-        )
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
@@ -402,7 +454,7 @@ class Consolidator:
     def estimate_session_prompt_tokens(self, session: Session) -> tuple[int, str]:
         """Estimate current prompt size for the normal session history view."""
         history = session.get_history(max_messages=0)
-        channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
+        channel, chat_id = session.key.split(":", 1) if ":" in session.key else (None, None)
         probe_messages = self._build_messages(
             history=history,
             current_message="[token-probe]",
@@ -488,7 +540,7 @@ class Consolidator:
                     return
 
                 end_idx = boundary[0]
-                chunk = session.messages[session.last_consolidated:end_idx]
+                chunk = session.messages[session.last_consolidated : end_idx]
                 if not chunk:
                     return
 
@@ -566,13 +618,14 @@ class Dream:
         batch = entries[: self.max_batch_size]
         logger.info(
             "Dream: processing {} entries (cursor {}→{}), batch={}",
-            len(entries), last_cursor, batch[-1]["cursor"], len(batch),
+            len(entries),
+            last_cursor,
+            batch[-1]["cursor"],
+            len(batch),
         )
 
         # Build history text for LLM
-        history_text = "\n".join(
-            f"[{e['timestamp']}] {e['content']}" for e in batch
-        )
+        history_text = "\n".join(f"[{e['timestamp']}] {e['content']}" for e in batch)
 
         # Current file contents
         current_date = datetime.now().strftime("%Y-%m-%d")
@@ -587,9 +640,7 @@ class Dream:
         )
 
         # Phase 1: Analyze
-        phase1_prompt = (
-            f"## Conversation History\n{history_text}\n\n{file_context}"
-        )
+        phase1_prompt = f"## Conversation History\n{history_text}\n\n{file_context}"
 
         try:
             phase1_response = await self.provider.chat_with_retry(
@@ -623,20 +674,28 @@ class Dream:
         ]
 
         try:
-            result = await self._runner.run(AgentRunSpec(
-                initial_messages=messages,
-                tools=tools,
-                model=self.model,
-                max_iterations=self.max_iterations,
-                max_tool_result_chars=self.max_tool_result_chars,
-                fail_on_tool_error=False,
-            ))
+            result = await self._runner.run(
+                AgentRunSpec(
+                    initial_messages=messages,
+                    tools=tools,
+                    model=self.model,
+                    max_iterations=self.max_iterations,
+                    max_tool_result_chars=self.max_tool_result_chars,
+                    fail_on_tool_error=False,
+                )
+            )
             logger.debug(
                 "Dream Phase 2 complete: stop_reason={}, tool_events={}",
-                result.stop_reason, len(result.tool_events),
+                result.stop_reason,
+                len(result.tool_events),
             )
-            for ev in (result.tool_events or []):
-                logger.info("Dream tool_event: name={}, status={}, detail={}", ev.get("name"), ev.get("status"), ev.get("detail", "")[:200])
+            for ev in result.tool_events or []:
+                logger.info(
+                    "Dream tool_event: name={}, status={}, detail={}",
+                    ev.get("name"),
+                    ev.get("status"),
+                    ev.get("detail", "")[:200],
+                )
         except Exception:
             logger.exception("Dream Phase 2 failed")
             result = None
@@ -656,13 +715,15 @@ class Dream:
         if result and result.stop_reason == "completed":
             logger.info(
                 "Dream done: {} change(s), cursor advanced to {}",
-                len(changelog), new_cursor,
+                len(changelog),
+                new_cursor,
             )
         else:
             reason = result.stop_reason if result else "exception"
             logger.warning(
                 "Dream incomplete ({}): cursor advanced to {}",
-                reason, new_cursor,
+                reason,
+                new_cursor,
             )
 
         # Git auto-commit (only when there are actual changes)
