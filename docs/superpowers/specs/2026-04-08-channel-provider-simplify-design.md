@@ -100,6 +100,35 @@ Remove exports for deleted providers.
 
 Retained as-is (no changes needed).
 
+## Dependency Cleanup
+
+### Removed from `dependencies` in `pyproject.toml`
+
+| Package | Reason |
+|---------|--------|
+| `anthropic` | Anthropic provider deleted |
+| `oauth-cli-kit` | OAuth providers (OpenAI Codex, GitHub Copilot) deleted |
+| `dingtalk-stream` | DingTalk channel deleted |
+| `python-telegram-bot[socks]` | Telegram channel deleted |
+| `lark-oapi` | Feishu channel deleted |
+| `socksio` | SOCKS support — only used by deleted channels (telegram, wecom, qq) |
+| `slack-sdk` | Slack channel deleted |
+| `slackify-markdown` | Slack channel deleted |
+| `qq-botpy` | QQ channel deleted |
+| `python-socks[asyncio]` | SOCKS support — only used by deleted channels |
+| `websocket-client` | WhatsApp channel deleted |
+| `websockets` | WhatsApp channel deleted |
+| `python-socketio` | Mochat channel deleted |
+| `msgpack` | Mochat channel deleted |
+| `chardet` | Not used anywhere in codebase |
+
+### Removed from `optional-dependencies`
+
+- `wecom` — WeCom channel deleted
+- `weixin` — WeChat channel deleted
+- `matrix` — Matrix channel deleted
+- `discord` — Discord channel deleted
+
 ## Preserved Architecture
 
 ### Channel Plugin System (unchanged)
