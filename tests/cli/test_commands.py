@@ -290,15 +290,6 @@ def test_config_falls_back_to_vllm_when_ollama_not_configured():
     assert config.get_api_base() == "http://localhost:8000"
 
 
-def test_openai_compat_provider_passes_model_through():
-    from nanobot.providers.openai_compat_provider import OpenAICompatProvider
-
-    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
-        provider = OpenAICompatProvider(default_model="github-copilot/gpt-5.3-codex")
-
-    assert provider.get_default_model() == "github-copilot/gpt-5.3-codex"
-
-
 def test_make_provider_passes_extra_headers_to_custom_provider():
     config = Config.model_validate(
         {

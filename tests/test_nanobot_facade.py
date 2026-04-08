@@ -13,8 +13,8 @@ from nanobot.nanobot import Nanobot, RunResult
 
 def _write_config(tmp_path: Path, overrides: dict | None = None) -> Path:
     data = {
-        "providers": {"openrouter": {"apiKey": "sk-test-key"}},
-        "agents": {"defaults": {"model": "openai/gpt-4.1"}},
+        "providers": {"custom": {"apiKey": "sk-test-key"}},
+        "agents": {"defaults": {"model": "custom/gpt-4.1"}},
     }
     if overrides:
         data.update(overrides)

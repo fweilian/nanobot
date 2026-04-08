@@ -407,6 +407,8 @@ def _make_provider(config: Config):
     """Create the appropriate LLM provider from config.
 
     Routing is driven by ``ProviderSpec.backend`` in the registry.
+    Only ``openai`` and ``custom`` providers are supported; both use
+    :class:`OpenAICompatProvider`.
     """
     from nanobot.providers.base import GenerationSettings
     from nanobot.providers.registry import find_by_name
@@ -418,13 +420,7 @@ def _make_provider(config: Config):
     backend = spec.backend if spec else "openai_compat"
 
     # --- validation ---
-    if backend == "azure_openai":
-        if not p or not p.api_key or not p.api_base:
-            console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
-            console.print("Set them in ~/.nanobot/config.json under providers.azure_openai section")
-            console.print("Use the model field to specify the deployment name.")
-            raise typer.Exit(1)
-    elif backend == "openai_compat" and not model.startswith("bedrock/"):
+    if backend == "openai_compat" and not model.startswith("bedrock/"):
         needs_key = not (p and p.api_key)
         exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
         if needs_key and not exempt:
@@ -432,17 +428,15 @@ def _make_provider(config: Config):
             console.print("Set one in ~/.nanobot/config.json under providers section")
             raise typer.Exit(1)
 
-    # --- instantiation by backend ---
-    else:
-        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+    from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 
-        provider = OpenAICompatProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-            spec=spec,
-        )
+    provider = OpenAICompatProvider(
+        api_key=p.api_key if p else None,
+        api_base=config.get_api_base(model),
+        default_model=model,
+        extra_headers=p.extra_headers if p else None,
+        spec=spec,
+    )
 
     defaults = config.agents.defaults
     provider.generation = GenerationSettings(
