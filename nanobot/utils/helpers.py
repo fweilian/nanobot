@@ -10,10 +10,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from nanobot.utils.user_context import get_current_user_id
-
 import tiktoken
 from loguru import logger
+
+from nanobot.utils.user_context import get_current_user_id
 
 if TYPE_CHECKING:
     from nanobot.providers.cloud_storage import CloudStorage
@@ -228,7 +228,9 @@ def maybe_persist_tool_result(
         return content
 
     # Determine storage key
-    storage_key = f"{_TOOL_RESULTS_DIR}/{safe_filename(session_key or 'default')}/{safe_filename(tool_call_id)}.{suffix}"
+    user_id = get_current_user_id()
+    user_prefix = f"workspaces/{user_id}/" if user_id else ""
+    storage_key = f"{user_prefix}{_TOOL_RESULTS_DIR}/{safe_filename(session_key or 'default')}/{safe_filename(tool_call_id)}.{suffix}"
 
     # Prepare content bytes
     if suffix == "json" and isinstance(content, list):
