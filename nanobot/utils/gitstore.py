@@ -27,9 +27,21 @@ class CommitInfo:
 class GitStore:
     """Git-backed version control for memory files."""
 
-    def __init__(self, workspace: Path, tracked_files: list[str]):
+    def __init__(
+        self,
+        workspace: Path,
+        tracked_files: list[str],
+        enabled: bool = True,
+    ):
         self._workspace = workspace
         self._tracked_files = tracked_files
+        self._enabled = enabled
+
+    def is_available(self) -> bool:
+        """Check if git-backed version control is available (enabled and initialized)."""
+        if not self._enabled:
+            return False
+        return (self._workspace / ".git").is_dir()
 
     def is_initialized(self) -> bool:
         """Check if the git repo has been initialized."""
