@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from nanobot.utils.user_context import get_current_user_id
+
 import tiktoken
 from loguru import logger
 
@@ -246,13 +248,16 @@ def maybe_persist_tool_result(
         )
     else:
         # Local file fallback
-        root = ensure_dir(workspace / _TOOL_RESULTS_DIR)
-        bucket = ensure_dir(root / safe_filename(session_key or "default"))
+        # storage_key may be a user-scoped relative path like "workspaces/{user_id}/.tool-results/..."
+        # We need to write to workspace / storage_key (not workspace / _TOOL_RESULTS_DIR / ...)
+        key = storage_key  # already includes user prefix from _FsTool._storage_key
+        local_path = workspace / key
+        bucket = ensure_dir(local_path.parent)
         try:
-            _cleanup_tool_result_buckets(root, bucket)
+            _cleanup_tool_result_buckets(bucket.parent, bucket)
         except Exception as exc:
-            logger.warning("Failed to clean stale tool result buckets in {}: {}", root, exc)
-        path = bucket / f"{safe_filename(tool_call_id)}.{suffix}"
+            logger.warning("Failed to clean stale tool result buckets in {}: {}", bucket.parent, exc)
+        path = local_path
         if not path.exists():
             if suffix == "json" and isinstance(content, list):
                 _write_text_atomic(path, json.dumps(content, ensure_ascii=False, indent=2))
