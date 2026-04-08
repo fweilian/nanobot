@@ -8,6 +8,7 @@ from typing import Any
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import BooleanSchema, IntegerSchema, StringSchema, tool_parameters_schema
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
+from nanobot.utils.user_context import get_current_user_id
 from nanobot.config.paths import get_media_dir
 
 
@@ -52,16 +53,26 @@ class _FsTool(Tool):
         self._extra_allowed_dirs = extra_allowed_dirs
 
     def _resolve(self, path: str) -> Path:
+        # Inject userId prefix for relative paths when user context is set
+        user_id = get_current_user_id()
+        if user_id and not Path(path).is_absolute():
+            path = f"workspaces/{user_id}/{path}"
         return _resolve_path(path, self._workspace, self._allowed_dir, self._extra_allowed_dirs)
 
     def _storage_key(self, path: str) -> str | None:
         """Return storage key if path is under workspace, None otherwise."""
         if self._workspace is None:
             return None
+        user_id = get_current_user_id()
+        if user_id:
+            # Prepend user-specific prefix for cloud storage keys
+            base_key = f"workspaces/{user_id}/"
+        else:
+            base_key = ""
         try:
             resolved = self._resolve(path).resolve()
             rel = resolved.relative_to(self._workspace.resolve())
-            return str(rel).replace("\\", "/")
+            return base_key + str(rel).replace("\\", "/")
         except ValueError:
             return None
 
