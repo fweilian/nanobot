@@ -55,7 +55,9 @@ class TestHistoryWithCursor:
 
     def test_append_history_includes_cursor_in_file(self, store):
         store.append_history("event 1")
-        content = store.read_file(store.history_file)
+        # Read via storage's workspace path directly
+        history_path = store._storage._workspace / store._history_file_key
+        content = history_path.read_text(encoding="utf-8")
         data = json.loads(content)
         assert data["cursor"] == 1
 
@@ -109,7 +111,10 @@ class TestDreamCursor:
 class TestLegacyHistoryMigration:
     def test_read_unprocessed_history_handles_entries_without_cursor(self, store):
         """JSONL entries with cursor=1 are correctly parsed and returned."""
-        store.history_file.write_text(
+        # Write directly via storage's workspace path
+        history_path = store._storage._workspace / store._history_file_key
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history_path.write_text(
             '{"cursor": 1, "timestamp": "2026-03-30 14:30", "content": "Old event"}\n',
             encoding="utf-8")
         entries = store.read_unprocessed_history(since_cursor=0)
@@ -144,8 +149,8 @@ class TestLegacyHistoryMigration:
         assert "USER: hello" in entries[1]["content"]
         assert entries[2]["timestamp"] == fallback_timestamp
         assert entries[2]["content"].startswith("Legacy chunk without timestamp.")
-        assert store.read_file(store._cursor_file).strip() == "3"
-        assert store.read_file(store._dream_cursor_file).strip() == "3"
+        assert store.read_file(store._storage._workspace / store._cursor_file_key).strip() == "3"
+        assert store.read_file(store._storage._workspace / store._dream_cursor_file_key).strip() == "3"
         assert not legacy_file.exists()
         assert (memory_dir / "HISTORY.md.bak").read_text(encoding="utf-8") == legacy_content
 
