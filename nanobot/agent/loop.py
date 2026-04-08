@@ -28,6 +28,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+from nanobot.utils.user_context import clear_current_user_id, set_current_user_id
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMProvider
@@ -455,6 +456,7 @@ class AgentLoop:
         gate = self._concurrency_gate or nullcontext()
         async with lock, gate:
             try:
+                set_current_user_id(msg.sender_id)
                 on_stream = on_stream_end = None
                 if msg.metadata.get("_wants_stream"):
                     # Split one answer into distinct stream segments.
@@ -521,6 +523,8 @@ class AgentLoop:
                         content="Sorry, I encountered an error.",
                     )
                 )
+            finally:
+                clear_current_user_id()
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
@@ -826,13 +830,14 @@ class AgentLoop:
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        sender_id: str = "user",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
+        msg = InboundMessage(channel=channel, sender_id=sender_id, chat_id=chat_id, content=content)
         return await self._process_message(
             msg,
             session_key=session_key,

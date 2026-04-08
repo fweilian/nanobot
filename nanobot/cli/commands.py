@@ -526,6 +526,7 @@ def serve(
         raise typer.Exit(1)
 
     from loguru import logger
+
     from nanobot.agent.loop import AgentLoop
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
@@ -579,6 +580,11 @@ def serve(
     console.print(f"  [cyan]Model[/cyan]    : {model_name}")
     console.print("  [cyan]Session[/cyan]  : api:default")
     console.print(f"  [cyan]Timeout[/cyan]  : {timeout}s")
+    jwt_secret = runtime_config.jwt.secret if runtime_config.jwt else ""
+    if not jwt_secret:
+        console.print("[red]Error:[/red] JWT secret is required for API server. Set 'jwt.secret' in config.")
+        raise typer.Exit(1)
+    console.print("  [cyan]JWT[/cyan]     : enabled")
     if host in {"0.0.0.0", "::"}:
         console.print(
             "[yellow]Warning:[/yellow] API is bound to all interfaces. "
@@ -586,7 +592,7 @@ def serve(
         )
     console.print()
 
-    api_app = create_app(agent_loop, model_name=model_name, request_timeout=timeout)
+    api_app = create_app(agent_loop, jwt_secret=jwt_secret, model_name=model_name, request_timeout=timeout)
 
     async def on_startup(_app):
         await agent_loop._connect_mcp()

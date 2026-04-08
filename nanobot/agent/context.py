@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from nanobot.config.schema import CloudStorageConfig
 
+from nanobot.utils.user_context import get_current_user_id
 from nanobot.utils.helpers import current_time_str
 
 from nanobot.agent.memory import MemoryStore
@@ -32,8 +33,16 @@ class ContextBuilder:
     ):
         self.workspace = workspace
         self.timezone = timezone
-        self.memory = MemoryStore(workspace, cloud_config=cloud_config)
-        self.skills = SkillsLoader(workspace)
+        scoped_workspace = self._get_user_scoped_workspace()
+        self.memory = MemoryStore(scoped_workspace, cloud_config=cloud_config)
+        self.skills = SkillsLoader(scoped_workspace)
+
+    def _get_user_scoped_workspace(self) -> Path:
+        """Return workspace path scoped to current user, or self.workspace if no user set."""
+        user_id = get_current_user_id()
+        if not user_id:
+            return self.workspace
+        return self.workspace / "workspaces" / user_id
 
     def build_system_prompt(
         self,

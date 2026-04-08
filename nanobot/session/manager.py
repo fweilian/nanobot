@@ -11,6 +11,7 @@ from loguru import logger
 from nanobot.config.paths import get_legacy_sessions_dir
 from nanobot.providers.cloud_storage import create_storage
 from nanobot.utils.helpers import find_legal_message_start, safe_filename
+from nanobot.utils.user_context import get_current_user_id
 
 if TYPE_CHECKING:
     from nanobot.config.schema import CloudStorageConfig
@@ -108,8 +109,10 @@ class SessionManager:
         workspace: Path,
         cloud_config: "CloudStorageConfig | None" = None,
     ):
-        self.workspace = workspace
-        self._storage = create_storage(cloud_config, workspace)
+        self._base_workspace = workspace
+        user_id = get_current_user_id()
+        self.workspace = workspace / "workspaces" / user_id if user_id else workspace
+        self._storage = create_storage(cloud_config, self.workspace)
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
 
