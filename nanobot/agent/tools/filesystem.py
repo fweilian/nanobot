@@ -54,6 +54,22 @@ class _FsTool(Tool):
     def _resolve(self, path: str) -> Path:
         return _resolve_path(path, self._workspace, self._allowed_dir, self._extra_allowed_dirs)
 
+    def _storage_key(self, path: str) -> str | None:
+        """Return storage key if path is under workspace, None otherwise."""
+        if self._workspace is None:
+            return None
+        try:
+            resolved = self._resolve(path).resolve()
+            rel = resolved.relative_to(self._workspace.resolve())
+            return str(rel).replace("\\", "/")
+        except ValueError:
+            return None
+
+    def _cloud_storage(self):
+        """Return CloudStorage instance if available, None otherwise."""
+        from nanobot.utils.helpers import get_storage
+        return get_storage()
+
 
 # ---------------------------------------------------------------------------
 # read_file
@@ -103,18 +119,30 @@ class ReadFileTool(_FsTool):
         try:
             if not path:
                 return "Error reading file: Unknown path"
-            fp = self._resolve(path)
-            if not fp.exists():
-                return f"Error: File not found: {path}"
-            if not fp.is_file():
-                return f"Error: Not a file: {path}"
 
-            raw = fp.read_bytes()
-            if not raw:
-                return f"(Empty file: {path})"
+            storage = self._cloud_storage()
+            storage_key = self._storage_key(path)
+
+            if storage and storage_key:
+                # Read from cloud storage
+                try:
+                    raw = storage.read(storage_key)
+                except FileNotFoundError:
+                    return f"Error: File not found: {path}"
+            else:
+                # Read from local filesystem
+                fp = self._resolve(path)
+                if not fp.exists():
+                    return f"Error: File not found: {path}"
+                if not fp.is_file():
+                    return f"Error: Not a file: {path}"
+                raw = fp.read_bytes()
+                if not raw:
+                    return f"(Empty file: {path})"
 
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
             if mime and mime.startswith("image/"):
+                fp = self._resolve(path)
                 return build_image_content_blocks(raw, mime, str(fp), f"(Image file: {path})")
 
             try:
@@ -189,10 +217,20 @@ class WriteFileTool(_FsTool):
                 raise ValueError("Unknown path")
             if content is None:
                 raise ValueError("Unknown content")
-            fp = self._resolve(path)
-            fp.parent.mkdir(parents=True, exist_ok=True)
-            fp.write_text(content, encoding="utf-8")
-            return f"Successfully wrote {len(content)} characters to {fp}"
+
+            storage = self._cloud_storage()
+            storage_key = self._storage_key(path)
+
+            if storage and storage_key:
+                # Write to cloud storage
+                storage.write(storage_key, content.encode("utf-8"))
+                return f"Successfully wrote {len(content)} characters to cloud:{storage_key}"
+            else:
+                # Write to local filesystem
+                fp = self._resolve(path)
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                fp.write_text(content, encoding="utf-8")
+                return f"Successfully wrote {len(content)} characters to {fp}"
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
@@ -267,11 +305,22 @@ class EditFileTool(_FsTool):
             if new_text is None:
                 raise ValueError("Unknown new_text")
 
-            fp = self._resolve(path)
-            if not fp.exists():
-                return f"Error: File not found: {path}"
+            storage = self._cloud_storage()
+            storage_key = self._storage_key(path)
 
-            raw = fp.read_bytes()
+            if storage and storage_key:
+                # Read from cloud storage
+                try:
+                    raw = storage.read(storage_key)
+                except FileNotFoundError:
+                    return f"Error: File not found: {path}"
+            else:
+                # Read from local filesystem
+                fp = self._resolve(path)
+                if not fp.exists():
+                    return f"Error: File not found: {path}"
+                raw = fp.read_bytes()
+
             uses_crlf = b"\r\n" in raw
             content = raw.decode("utf-8").replace("\r\n", "\n")
             match, count = _find_match(content, old_text.replace("\r\n", "\n"))
@@ -289,8 +338,13 @@ class EditFileTool(_FsTool):
             if uses_crlf:
                 new_content = new_content.replace("\n", "\r\n")
 
-            fp.write_bytes(new_content.encode("utf-8"))
-            return f"Successfully edited {fp}"
+            if storage and storage_key:
+                storage.write(storage_key, new_content.encode("utf-8"))
+                return f"Successfully edited cloud:{storage_key}"
+            else:
+                fp = self._resolve(path)
+                fp.write_bytes(new_content.encode("utf-8"))
+                return f"Successfully edited {fp}"
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
