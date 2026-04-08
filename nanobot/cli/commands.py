@@ -541,13 +541,13 @@ def serve(
     host = host if host is not None else api_cfg.host
     port = port if port is not None else api_cfg.port
     timeout = timeout if timeout is not None else api_cfg.timeout
-    sync_workspace_templates(runtime_config.workspace_path)
-    # Initialize cloud storage if configured
+    # Initialize cloud storage if configured (must be before sync_workspace_templates)
     from nanobot.providers.cloud_storage import create_storage
     from nanobot.utils.helpers import set_storage
 
     storage = create_storage(runtime_config.cloud_storage, runtime_config.workspace_path)
     set_storage(storage)
+    sync_workspace_templates(runtime_config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(runtime_config)
     session_manager = SessionManager(
@@ -630,13 +630,13 @@ def gateway(
     port = port if port is not None else config.gateway.port
 
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
-    sync_workspace_templates(config.workspace_path)
-    # Initialize cloud storage if configured
+    # Initialize cloud storage if configured (must be before sync_workspace_templates)
     from nanobot.providers.cloud_storage import create_storage
     from nanobot.utils.helpers import set_storage
 
     storage = create_storage(config.cloud_storage, config.workspace_path)
     set_storage(storage)
+    sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path, cloud_config=config.cloud_storage)
@@ -881,13 +881,13 @@ def agent(
     from nanobot.cron.service import CronService
 
     config = _load_runtime_config(config, workspace)
-    sync_workspace_templates(config.workspace_path)
-    # Initialize cloud storage if configured
+    # Initialize cloud storage if configured (must be before sync_workspace_templates)
     from nanobot.providers.cloud_storage import create_storage
     from nanobot.utils.helpers import set_storage
 
     storage = create_storage(config.cloud_storage, config.workspace_path)
     set_storage(storage)
+    sync_workspace_templates(config.workspace_path)
 
     bus = MessageBus()
     provider = _make_provider(config)
