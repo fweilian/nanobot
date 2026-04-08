@@ -1,7 +1,8 @@
+import jwt
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+
 from nanobot.api.middleware import JWTAuthMiddleware
-import jwt
 
 
 def _make_token(payload: dict, secret: str = "test-secret") -> str:

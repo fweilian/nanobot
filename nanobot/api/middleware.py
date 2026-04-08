@@ -1,8 +1,9 @@
 """JWT 认证中间件，用于 aiohttp."""
 
-from aiohttp import web
-from typing import Callable, Awaitable
+from typing import Awaitable, Callable
+
 import jwt
+from aiohttp import web
 
 
 class JWTAuthMiddleware:
