@@ -7,6 +7,8 @@ from typing import Awaitable, Callable
 import jwt
 from aiohttp import web
 
+WORKSPACE_KEY = web.AppKey("workspace")
+
 
 class JWTAuthMiddleware:
     """验证 JWT token 并将 userId claim 提取到 request['user_id']."""
@@ -52,7 +54,7 @@ class JWTAuthMiddleware:
 
     async def _ensure_user_workspace(self, request: web.Request, user_id: str) -> None:
         """确保用户 workspace 已初始化（幂等操作）."""
-        workspace = request.app.get("workspace")
+        workspace = request.app.get(WORKSPACE_KEY)
         if not workspace:
             return
         user_workspace = workspace / "workspaces" / user_id
