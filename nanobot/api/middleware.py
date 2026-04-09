@@ -1,5 +1,7 @@
 """JWT 认证中间件，用于 aiohttp."""
 
+import asyncio
+from pathlib import Path
 from typing import Awaitable, Callable
 
 import jwt
@@ -15,6 +17,10 @@ class JWTAuthMiddleware:
         self.secret = secret.encode()
 
     async def __call__(self, request: web.Request, handler: Callable[[web.Request], Awaitable[web.Response]]) -> web.Response:
+        # Skip auth for public endpoints
+        if request.path in {"/health", "/v1/models"}:
+            return await handler(request)
+
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             return _error(401, "Missing or invalid Authorization header")
@@ -38,8 +44,24 @@ class JWTAuthMiddleware:
         if not user_id:
             return _error(401, "Missing userId in token")
 
+        # 初始化用户 workspace（幂等操作，首次登录时触发）
+        await self._ensure_user_workspace(request, user_id)
+
         request["user_id"] = user_id
         return await handler(request)
+
+    async def _ensure_user_workspace(self, request: web.Request, user_id: str) -> None:
+        """确保用户 workspace 已初始化（幂等操作）."""
+        workspace = request.app.get("workspace")
+        if not workspace:
+            return
+        user_workspace = workspace / "workspaces" / user_id
+        # sync_workspace_templates 是同步的，在线程池中运行
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: _sync_user_workspace(user_workspace, user_id),
+        )
 
 
 def _error(status: int, message: str) -> web.Response:
@@ -47,3 +69,10 @@ def _error(status: int, message: str) -> web.Response:
         {"error": {"message": message, "type": "invalid_request_error", "code": status}},
         status=status,
     )
+
+
+def _sync_user_workspace(user_workspace: Path, user_id: str) -> None:
+    """Sync templates to user workspace with correct cloud storage prefix."""
+    from nanobot.utils.helpers import sync_workspace_templates
+    storage_prefix = f"workspaces/{user_id}/"
+    sync_workspace_templates(user_workspace, silent=True, storage_prefix=storage_prefix)
