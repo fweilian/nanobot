@@ -7,6 +7,7 @@ All requests route to a single persistent API session.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from typing import Any
@@ -49,6 +50,22 @@ def _chat_completion_response(content: str, model: str) -> dict[str, Any]:
     }
 
 
+def _sse_chunk(content: str, id: str, model: str, created: int, role_sent: bool = False, finish_reason: str | None = None) -> bytes:
+    """Build an OpenAI-compatible SSE chunk."""
+    delta = {}
+    if not role_sent:
+        delta["role"] = "assistant"
+    if content:
+        delta["content"] = content
+    choice = {"index": 0, "delta": delta, "finish_reason": finish_reason}
+    chunk = {"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [choice]}
+    return f"data: {json.dumps(chunk)}\n\n".encode()
+
+
+def _sse_done() -> bytes:
+    return b"data: [DONE]\n\n"
+
+
 def _response_text(value: Any) -> str:
     """Normalize process_direct output to plain assistant text."""
     if value is None:
@@ -75,10 +92,6 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     if not isinstance(messages, list) or len(messages) != 1:
         return _error_json(400, "Only a single user message is supported")
 
-    # Stream not yet supported
-    if body.get("stream", False):
-        return _error_json(400, "stream=true is not supported yet. Set stream=false or omit it.")
-
     message = messages[0]
     if not isinstance(message, dict) or message.get("role") != "user":
         return _error_json(400, "Only a single user message is supported")
@@ -98,11 +111,69 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     session_key = f"api:{body['session_id']}" if body.get("session_id") else API_SESSION_KEY
     session_locks: dict[str, asyncio.Lock] = request.app["session_locks"]
     session_lock = session_locks.setdefault(session_key, asyncio.Lock())
+    sender_id = request.get("user_id", "anonymous")
+
+    # SSE streaming branch
+    if body.get("stream", False):
+        resp = web.StreamResponse(
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            }
+        )
+        await resp.prepare(request)
+
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+
+        role_sent_wrapper = [False]  # closure mutable cell for role_sent
+
+        def sse_write(delta: str) -> None:
+            if delta:
+                chunk = _sse_chunk(delta, completion_id, model_name, created, role_sent=role_sent_wrapper[0])
+                resp.write(chunk)
+                role_sent_wrapper[0] = True
+
+        async def sse_end(resuming: bool = False) -> None:
+            resp.write(_sse_chunk("", completion_id, model_name, created, role_sent=role_sent_wrapper[0], finish_reason="stop"))
+            resp.write(_sse_done())
+            await resp.write_eof()
+
+        try:
+            async with session_lock:
+                try:
+                    await asyncio.wait_for(
+                        agent_loop.process_direct(
+                            content=user_content,
+                            session_key=session_key,
+                            channel="api",
+                            chat_id=API_CHAT_ID,
+                            sender_id=sender_id,
+                            on_stream=sse_write,
+                            on_stream_end=sse_end,
+                        ),
+                        timeout=timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    resp.write(_sse_done())
+                    await resp.write_eof()
+                    return resp
+                except Exception:
+                    resp.write(_sse_done())
+                    await resp.write_eof()
+                    raise
+        except Exception:
+            logger.exception("Unexpected API lock error for session {}", session_key)
+            resp.write(_sse_done())
+            await resp.write_eof()
+            raise
+
+        return resp
 
     logger.info("API request session_key={} content={}", session_key, user_content[:80])
 
     _fallback = EMPTY_FINAL_RESPONSE_MESSAGE
-    sender_id = request.get("user_id", "anonymous")
 
     try:
         async with session_lock:
