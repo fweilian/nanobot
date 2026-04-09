@@ -129,15 +129,15 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
         role_sent_wrapper = [False]  # closure mutable cell for role_sent
 
-        def sse_write(delta: str) -> None:
+        async def sse_write(delta: str) -> None:
             if delta:
                 chunk = _sse_chunk(delta, completion_id, model_name, created, role_sent=role_sent_wrapper[0])
-                resp.write(chunk)
+                await resp.write(chunk)
                 role_sent_wrapper[0] = True
 
         async def sse_end(resuming: bool = False) -> None:
-            resp.write(_sse_chunk("", completion_id, model_name, created, role_sent=role_sent_wrapper[0], finish_reason="stop"))
-            resp.write(_sse_done())
+            await resp.write(_sse_chunk("", completion_id, model_name, created, role_sent=role_sent_wrapper[0], finish_reason="stop"))
+            await resp.write(_sse_done())
             await resp.write_eof()
 
         try:
@@ -158,6 +158,9 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                 except asyncio.TimeoutError:
                     resp.write(_sse_done())
                     await resp.write_eof()
+                    # Note: For SSE, once we start streaming 200 we cannot return a different
+                    # response type. The [DONE] sentinel signals the abnormal end; the client
+                    # can infer timeout from the stream ending unexpectedly.
                     return resp
                 except Exception:
                     resp.write(_sse_done())

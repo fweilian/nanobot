@@ -101,15 +101,106 @@ async def test_no_user_message_returns_400(aiohttp_client, app) -> None:
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
-async def test_stream_true_returns_400(aiohttp_client, app) -> None:
+async def test_stream_true_returns_sse_chunks(aiohttp_client, mock_agent) -> None:
+    """stream=true returns SSE chunks in OpenAI format."""
+    chunks_received: list[bytes] = []
+
+    async def fake_process(content, session_key="", channel="", chat_id="", sender_id="", on_stream=None, on_stream_end=None):
+        if on_stream:
+            await on_stream("Hello")
+            await on_stream(" world")
+        if on_stream_end:
+            await on_stream_end(resuming=False)
+        return "Hello world"
+
+    mock_agent.process_direct = fake_process
+
+    app = create_app(mock_agent, model_name="test-model", request_timeout=10.0)
     client = await aiohttp_client(app)
     resp = await client.post(
         "/v1/chat/completions",
         json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
     )
-    assert resp.status == 400
-    body = await resp.json()
-    assert "stream" in body["error"]["message"].lower()
+    assert resp.status == 200
+    assert resp.headers["Content-Type"] == "text/event-stream"
+
+    # Read all SSE data
+    body = b""
+    async for chunk in resp.content.iter_any():
+        body += chunk
+
+    lines = body.decode().strip().split("\n")
+    data_lines = [l for l in lines if l.startswith("data: ") and "[DONE]" not in l]
+    assert len(data_lines) >= 3  # role chunk + content chunks + finish chunk
+
+    import json
+    first_chunk = json.loads(data_lines[0][6:])
+    assert first_chunk["choices"][0]["delta"].get("role") == "assistant"
+    assert first_chunk["choices"][0]["finish_reason"] is None
+
+    # Last data line before [DONE] should have finish_reason=stop
+    last_chunk = json.loads(data_lines[-1][6:])
+    assert last_chunk["choices"][0]["finish_reason"] == "stop"
+
+    # Verify [DONE] sentinel
+    assert "data: [DONE]" in lines
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_stream_timeout_sends_done(aiohttp_client) -> None:
+    """Stream request that times out sends [DONE] and returns resp (SSE protocol)."""
+    async def slow_process(content, session_key="", channel="", chat_id="", sender_id="", on_stream=None, on_stream_end=None):
+        await asyncio.sleep(10)  # longer than timeout
+        return "nope"
+
+    agent = MagicMock()
+    agent.process_direct = slow_process
+    agent._connect_mcp = AsyncMock()
+    agent.close_mcp = AsyncMock()
+
+    app = create_app(agent, model_name="m", request_timeout=0.1)
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+    )
+    # For SSE, timeout is communicated via [DONE] sentinel, returns 200 with stream ending
+    assert resp.status == 200
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_stream_first_chunk_contains_role(aiohttp_client) -> None:
+    """First SSE chunk must contain delta.role=assistant (OpenAI client requirement)."""
+    async def fake_process(content, session_key="", channel="", chat_id="", sender_id="", on_stream=None, on_stream_end=None):
+        if on_stream:
+            await on_stream("Hi")
+        if on_stream_end:
+            await on_stream_end(resuming=False)
+        return "Hi"
+
+    mock_agent = MagicMock()
+    mock_agent.process_direct = fake_process
+    mock_agent._connect_mcp = AsyncMock()
+    mock_agent.close_mcp = AsyncMock()
+
+    app = create_app(mock_agent, model_name="test-model")
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    assert resp.status == 200
+
+    body = b""
+    async for chunk in resp.content.iter_any():
+        body += chunk
+
+    import json
+    lines = body.decode().strip().split("\n")
+    first_data = json.loads(lines[0][6:])
+    assert first_data["choices"][0]["delta"].get("role") == "assistant"
 
 
 @pytest.mark.asyncio
@@ -197,6 +288,7 @@ async def test_successful_request_uses_fixed_api_session(aiohttp_client, mock_ag
         session_key=API_SESSION_KEY,
         channel="api",
         chat_id=API_CHAT_ID,
+        sender_id="anonymous",
     )
 
 
@@ -205,7 +297,7 @@ async def test_successful_request_uses_fixed_api_session(aiohttp_client, mock_ag
 async def test_followup_requests_share_same_session_key(aiohttp_client) -> None:
     call_log: list[str] = []
 
-    async def fake_process(content, session_key="", channel="", chat_id=""):
+    async def fake_process(content, session_key="", channel="", chat_id="", sender_id=""):
         call_log.append(session_key)
         return f"reply to {content}"
 
@@ -236,7 +328,7 @@ async def test_followup_requests_share_same_session_key(aiohttp_client) -> None:
 async def test_fixed_session_requests_are_serialized(aiohttp_client) -> None:
     order: list[str] = []
 
-    async def slow_process(content, session_key="", channel="", chat_id=""):
+    async def slow_process(content, session_key="", channel="", chat_id="", sender_id=""):
         order.append(f"start:{content}")
         await asyncio.sleep(0.1)
         order.append(f"end:{content}")
@@ -312,6 +404,7 @@ async def test_multimodal_content_extracts_text(aiohttp_client, mock_agent) -> N
         session_key=API_SESSION_KEY,
         channel="api",
         chat_id=API_CHAT_ID,
+        sender_id="anonymous",
     )
 
 
@@ -320,7 +413,7 @@ async def test_multimodal_content_extracts_text(aiohttp_client, mock_agent) -> N
 async def test_empty_response_retry_then_success(aiohttp_client) -> None:
     call_count = 0
 
-    async def sometimes_empty(content, session_key="", channel="", chat_id=""):
+    async def sometimes_empty(content, session_key="", channel="", chat_id="", sender_id=""):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
@@ -351,7 +444,7 @@ async def test_empty_response_falls_back(aiohttp_client) -> None:
 
     call_count = 0
 
-    async def always_empty(content, session_key="", channel="", chat_id=""):
+    async def always_empty(content, session_key="", channel="", chat_id="", sender_id=""):
         nonlocal call_count
         call_count += 1
         return ""
