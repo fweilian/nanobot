@@ -583,6 +583,7 @@ def _patch_serve_runtime(monkeypatch, config: Config, seen: dict[str, object]) -
 
     class _FakeAgentLoop:
         def __init__(self, **kwargs) -> None:
+            self.workspace = kwargs.get("workspace", Path("/fake/workspace"))
             seen["workspace"] = kwargs["workspace"]
 
         async def _connect_mcp(self) -> None:
@@ -591,11 +592,12 @@ def _patch_serve_runtime(monkeypatch, config: Config, seen: dict[str, object]) -
         async def close_mcp(self) -> None:
             return None
 
-    def _fake_create_app(agent_loop, *, jwt_secret: str = "", model_name: str = "nanobot", request_timeout: float = 120.0):
+    def _fake_create_app(agent_loop, *, jwt_secret: str = "", model_name: str = "nanobot", request_timeout: float = 120.0, workspace: Path = Path("/fake/workspace")):
         seen["agent_loop"] = agent_loop
         seen["jwt_secret"] = jwt_secret
         seen["model_name"] = model_name
         seen["request_timeout"] = request_timeout
+        seen["workspace"] = workspace
         return _FakeApiApp()
 
     def _fake_run_app(api_app, host: str, port: int, print):
