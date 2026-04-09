@@ -592,7 +592,7 @@ def serve(
         )
     console.print()
 
-    api_app = create_app(agent_loop, jwt_secret=jwt_secret, model_name=model_name, request_timeout=timeout, workspace=agent_loop.workspace)
+    api_app = create_app(agent_loop, jwt_secret=jwt_secret, model_name=model_name, request_timeout=timeout)
 
     async def on_startup(_app):
         await agent_loop._connect_mcp()
