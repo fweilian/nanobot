@@ -476,7 +476,7 @@ def build_status_content(
     return "\n".join(lines)    
 
 
-def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
+def sync_workspace_templates(workspace: Path, silent: bool = False, storage_prefix: str = "") -> list[str]:
     """Sync bundled templates to workspace. Only creates missing files."""
     from importlib.resources import files as pkg_files
     try:
@@ -506,9 +506,9 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
 
     for item in tpl.iterdir():
         if item.name.endswith(".md") and not item.name.startswith("."):
-            _write(item, workspace / item.name, item.name)
-    _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md", "memory/MEMORY.md")
-    _write(None, workspace / "memory" / "history.jsonl", "memory/history.jsonl")
+            _write(item, workspace / item.name, f"{storage_prefix}{item.name}")
+    _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md", f"{storage_prefix}memory/MEMORY.md")
+    _write(None, workspace / "memory" / "history.jsonl", f"{storage_prefix}memory/history.jsonl")
     if _storage is None:
         (workspace / "skills").mkdir(exist_ok=True)
 
