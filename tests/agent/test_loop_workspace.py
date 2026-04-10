@@ -123,3 +123,51 @@ async def test_no_user_context_falls_back_to_workspace(tmp_path):
     clear_current_user_id()
     resolved = tool._resolve("myfile.txt")
     assert "workspaces" not in str(resolved)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_storage_key_is_user_scoped_once(tmp_path):
+    from nanobot.agent.tools.filesystem import WriteFileTool
+
+    tool = WriteFileTool(workspace=tmp_path)
+
+    set_current_user_id("alice")
+    try:
+        key = tool._storage_key("USER.md")
+        assert key == "workspaces/alice/USER.md"
+    finally:
+        clear_current_user_id()
+
+
+@pytest.mark.asyncio
+async def test_memory_store_user_md_writes_to_scoped_path(tmp_path):
+    from nanobot.agent.memory import MemoryStore
+
+    store = MemoryStore(tmp_path)
+
+    set_current_user_id("alice")
+    try:
+        store.write_user("hello")
+    finally:
+        clear_current_user_id()
+
+    assert (tmp_path / "workspaces" / "alice" / "USER.md").read_text(encoding="utf-8") == "hello"
+
+
+@pytest.mark.asyncio
+async def test_context_builder_bootstrap_reads_user_md(tmp_path):
+    from nanobot.agent.context import ContextBuilder
+
+    user_dir = tmp_path / "workspaces" / "alice"
+    user_dir.mkdir(parents=True)
+    (user_dir / "USER.md").write_text("alice-user", encoding="utf-8")
+
+    builder = ContextBuilder(tmp_path)
+
+    set_current_user_id("alice")
+    try:
+        prompt = builder.build_system_prompt(channel="test")
+    finally:
+        clear_current_user_id()
+
+    assert "alice-user" in prompt

@@ -456,7 +456,10 @@ class AgentLoop:
         gate = self._concurrency_gate or nullcontext()
         async with lock, gate:
             try:
-                set_current_user_id(msg.sender_id)
+                if msg.channel in {"cli", "system"}:
+                    set_current_user_id(None)
+                else:
+                    set_current_user_id(msg.sender_id)
                 on_stream = on_stream_end = None
                 if msg.metadata.get("_wants_stream"):
                     # Split one answer into distinct stream segments.

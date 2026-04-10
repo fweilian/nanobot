@@ -33,9 +33,8 @@ class ContextBuilder:
     ):
         self.workspace = workspace
         self.timezone = timezone
-        scoped_workspace = self._get_user_scoped_workspace()
-        self.memory = MemoryStore(scoped_workspace, cloud_config=cloud_config)
-        self.skills = SkillsLoader(scoped_workspace)
+        self.memory = MemoryStore(workspace, cloud_config=cloud_config)
+        self._skills_by_user: dict[str | None, SkillsLoader] = {}
 
     def _get_user_scoped_workspace(self) -> Path:
         """Return workspace path scoped to current user, or self.workspace if no user set."""
@@ -60,13 +59,14 @@ class ContextBuilder:
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
-        always_skills = self.skills.get_always_skills()
+        skills = self._get_skills_loader()
+        always_skills = skills.get_always_skills()
         if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
+            always_content = skills.load_skills_for_context(always_skills)
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
 
-        skills_summary = self.skills.build_skills_summary()
+        skills_summary = skills.build_skills_summary()
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
@@ -126,16 +126,26 @@ class ContextBuilder:
         return _to_blocks(left) + _to_blocks(right)
 
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
+        """Load all bootstrap files from storage (local or cloud)."""
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
-            file_path = self.workspace / filename
-            if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
+            if self.memory.exists(filename):
+                content = self.memory.read_text(filename)
+                if content:
+                    parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
+
+    def _get_skills_loader(self) -> SkillsLoader:
+        user_id = get_current_user_id()
+        loader = self._skills_by_user.get(user_id)
+        if loader is not None:
+            return loader
+        scoped = self._get_user_scoped_workspace()
+        loader = SkillsLoader(scoped)
+        self._skills_by_user[user_id] = loader
+        return loader
 
     def build_messages(
         self,

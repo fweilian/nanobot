@@ -53,26 +53,44 @@ class _FsTool(Tool):
         self._extra_allowed_dirs = extra_allowed_dirs
 
     def _resolve(self, path: str) -> Path:
-        # Inject userId prefix for relative paths when user context is set
         user_id = get_current_user_id()
-        if user_id and not Path(path).is_absolute():
-            path = f"workspaces/{user_id}/{path}"
+        if user_id and self._workspace is not None:
+            ws = self._workspace.resolve()
+            if ws.name == user_id and ws.parent.name == "workspaces":
+                user_root = ws
+            else:
+                user_root = (ws / "workspaces" / user_id).resolve()
+
+            p = Path(path).expanduser()
+            if not p.is_absolute():
+                p = user_root / p
+            resolved = p.resolve()
+            if not _is_under(resolved, user_root):
+                raise PermissionError(f"Path {path} is outside user workspace {user_root}")
+            return _resolve_path(
+                str(resolved),
+                workspace=None,
+                allowed_dir=self._allowed_dir,
+                extra_allowed_dirs=self._extra_allowed_dirs,
+            )
+
         return _resolve_path(path, self._workspace, self._allowed_dir, self._extra_allowed_dirs)
 
     def _storage_key(self, path: str) -> str | None:
         """Return storage key if path is under workspace, None otherwise."""
         if self._workspace is None:
             return None
-        user_id = get_current_user_id()
-        if user_id:
-            # Prepend user-specific prefix for cloud storage keys
-            base_key = f"workspaces/{user_id}/"
-        else:
-            base_key = ""
         try:
             resolved = self._resolve(path).resolve()
+            user_id = get_current_user_id()
+            if user_id:
+                ws = self._workspace.resolve()
+                if ws.name == user_id and ws.parent.name == "workspaces":
+                    rel_user = resolved.relative_to(ws)
+                    return f"workspaces/{user_id}/" + str(rel_user).replace("\\", "/")
+
             rel = resolved.relative_to(self._workspace.resolve())
-            return base_key + str(rel).replace("\\", "/")
+            return str(rel).replace("\\", "/")
         except ValueError:
             return None
 

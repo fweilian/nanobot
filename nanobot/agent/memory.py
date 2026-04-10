@@ -18,6 +18,7 @@ from nanobot.providers.cloud_storage import create_storage
 from nanobot.utils.gitstore import GitStore
 from nanobot.utils.helpers import estimate_message_tokens, estimate_prompt_tokens_chain, strip_think
 from nanobot.utils.prompt_templates import render_template
+from nanobot.utils.user_context import get_current_user_id
 
 if TYPE_CHECKING:
     from nanobot.config.schema import CloudStorageConfig
@@ -47,6 +48,7 @@ class MemoryStore:
         max_history_entries: int = _DEFAULT_MAX_HISTORY,
     ):
         self.workspace = workspace
+        self._cloud_mode = cloud_config is not None
         self._storage = create_storage(cloud_config, workspace)
         self.max_history_entries = max_history_entries
         self._git = GitStore(
@@ -100,17 +102,31 @@ class MemoryStore:
 
     # -- storage helpers -------------------------------------------------------
 
+    def _scoped_key(self, key: str) -> str:
+        user_id = get_current_user_id()
+        if not user_id:
+            return key
+        if key.startswith("workspaces/"):
+            return key
+        return f"workspaces/{user_id}/{key}"
+
     def _read_bytes(self, key: str) -> bytes:
         try:
-            return self._storage.read(key)
+            return self._storage.read(self._scoped_key(key))
         except FileNotFoundError:
             return b""
 
     def _write_bytes(self, key: str, data: bytes) -> None:
-        self._storage.write(key, data)
+        self._storage.write(self._scoped_key(key), data)
 
     def _exists(self, key: str) -> bool:
-        return self._storage.exists(key)
+        return self._storage.exists(self._scoped_key(key))
+
+    def exists(self, key: str) -> bool:
+        return self._exists(key)
+
+    def read_text(self, key: str) -> str:
+        return self._read_bytes(key).decode("utf-8", errors="replace")
 
     # -- generic helpers -----------------------------------------------------
 
@@ -288,10 +304,7 @@ class MemoryStore:
         }
         entry_line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
         # Append to existing content
-        try:
-            existing = self._storage.read(self._history_file_key)
-        except FileNotFoundError:
-            existing = b""
+        existing = self._read_bytes(self._history_file_key)
         self._write_bytes(self._history_file_key, existing + entry_line)
         self._write_bytes(self._cursor_file_key, str(cursor).encode("utf-8"))
         return cursor
