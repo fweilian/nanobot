@@ -7,7 +7,9 @@ from typing import Awaitable, Callable
 import jwt
 from aiohttp import web
 
-WORKSPACE_KEY = web.AppKey("workspace")
+# Use string key directly to avoid AppKey/string mismatch issues
+# with request.app.get() vs app["key"] access patterns
+WORKSPACE_KEY = "workspace"
 
 
 class JWTAuthMiddleware:

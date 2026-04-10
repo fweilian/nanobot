@@ -130,10 +130,9 @@ async def test_stream_true_returns_sse_chunks(aiohttp_client, mock_agent) -> Non
         body += chunk
 
     lines = body.decode().strip().split("\n")
-    data_lines = [l for l in lines if l.startswith("data: ") and "[DONE]" not in l]
+    data_lines = [l for l in lines if l.startswith("data: ") and l != "data: [DONE]"]
     assert len(data_lines) >= 3  # role chunk + content chunks + finish chunk
 
-    import json
     first_chunk = json.loads(data_lines[0][6:])
     assert first_chunk["choices"][0]["delta"].get("role") == "assistant"
     assert first_chunk["choices"][0]["finish_reason"] is None
@@ -168,6 +167,13 @@ async def test_stream_timeout_sends_done(aiohttp_client) -> None:
     # For SSE, timeout is communicated via [DONE] sentinel, returns 200 with stream ending
     assert resp.status == 200
 
+    body = b""
+    async for chunk in resp.content.iter_any():
+        body += chunk
+
+    lines = body.decode().strip().split("\n")
+    assert "data: [DONE]" in lines
+
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
@@ -199,7 +205,8 @@ async def test_stream_first_chunk_contains_role(aiohttp_client) -> None:
 
     import json
     lines = body.decode().strip().split("\n")
-    first_data = json.loads(lines[0][6:])
+    data_lines = [l for l in lines if l.startswith("data: ") and l != "data: [DONE]"]
+    first_data = json.loads(data_lines[0][6:])
     assert first_data["choices"][0]["delta"].get("role") == "assistant"
 
 

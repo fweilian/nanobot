@@ -156,19 +156,19 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         timeout=timeout_s,
                     )
                 except asyncio.TimeoutError:
-                    resp.write(_sse_done())
+                    await resp.write(_sse_done())
                     await resp.write_eof()
                     # Note: For SSE, once we start streaming 200 we cannot return a different
                     # response type. The [DONE] sentinel signals the abnormal end; the client
                     # can infer timeout from the stream ending unexpectedly.
                     return resp
                 except Exception:
-                    resp.write(_sse_done())
+                    await resp.write(_sse_done())
                     await resp.write_eof()
                     raise
         except Exception:
             logger.exception("Unexpected API lock error for session {}", session_key)
-            resp.write(_sse_done())
+            await resp.write(_sse_done())
             await resp.write_eof()
             raise
 
