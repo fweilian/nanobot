@@ -7,6 +7,7 @@ All requests route to a single persistent API session.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from typing import Any
@@ -49,6 +50,35 @@ def _chat_completion_response(content: str, model: str) -> dict[str, Any]:
     }
 
 
+def _sse_chunk(
+    content: str,
+    *,
+    completion_id: str,
+    model: str,
+    created: int,
+    role_sent: bool,
+    finish_reason: str | None = None,
+) -> bytes:
+    delta: dict[str, Any] = {}
+    if not role_sent:
+        delta["role"] = "assistant"
+    if content:
+        delta["content"] = content
+    choice = {"index": 0, "delta": delta, "finish_reason": finish_reason}
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [choice],
+    }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def _sse_done() -> bytes:
+    return b"data: [DONE]\n\n"
+
+
 def _response_text(value: Any) -> str:
     """Normalize process_direct output to plain assistant text."""
     if value is None:
@@ -75,10 +105,6 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     if not isinstance(messages, list) or len(messages) != 1:
         return _error_json(400, "Only a single user message is supported")
 
-    # Stream not yet supported
-    if body.get("stream", False):
-        return _error_json(400, "stream=true is not supported yet. Set stream=false or omit it.")
-
     message = messages[0]
     if not isinstance(message, dict) or message.get("role") != "user":
         return _error_json(400, "Only a single user message is supported")
@@ -103,6 +129,112 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
     _fallback = EMPTY_FINAL_RESPONSE_MESSAGE
     sender_id = request.get("user_id", "anonymous")
+
+    if body.get("stream", False):
+        resp = web.StreamResponse(
+            status=200,
+            reason="OK",
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await resp.prepare(request)
+
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+        role_sent = False
+        finalized = False
+
+        async def sse_finalize(*, resuming: bool = False) -> None:
+            nonlocal finalized, role_sent
+            if finalized:
+                return
+            finalized = True
+            try:
+                await resp.write(
+                    _sse_chunk(
+                        "",
+                        completion_id=completion_id,
+                        model=model_name,
+                        created=created,
+                        role_sent=role_sent,
+                        finish_reason="stop",
+                    )
+                )
+                await resp.write(_sse_done())
+                await resp.write_eof()
+            except Exception:
+                pass
+
+        async def sse_write(delta: str) -> None:
+            nonlocal finalized, role_sent
+            if finalized or not delta:
+                return
+            try:
+                await resp.write(
+                    _sse_chunk(
+                        delta,
+                        completion_id=completion_id,
+                        model=model_name,
+                        created=created,
+                        role_sent=role_sent,
+                    )
+                )
+                role_sent = True
+            except Exception:
+                finalized = True
+
+        try:
+            await resp.write(
+                _sse_chunk(
+                    "",
+                    completion_id=completion_id,
+                    model=model_name,
+                    created=created,
+                    role_sent=role_sent,
+                )
+            )
+            role_sent = True
+        except Exception:
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
+            return resp
+
+        try:
+            async with session_lock:
+                try:
+                    await asyncio.wait_for(
+                        agent_loop.process_direct(
+                            content=user_content,
+                            session_key=session_key,
+                            channel="api",
+                            chat_id=API_CHAT_ID,
+                            sender_id=sender_id,
+                            on_stream=sse_write,
+                            on_stream_end=sse_finalize,
+                        ),
+                        timeout=timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    await sse_finalize(resuming=False)
+                except asyncio.CancelledError:
+                    await sse_finalize(resuming=False)
+                    raise
+                except Exception:
+                    logger.exception("Error processing stream request for session {}", session_key)
+                    await sse_finalize(resuming=False)
+        except Exception:
+            logger.exception("Unexpected API lock error for session {}", session_key)
+            try:
+                await sse_finalize(resuming=False)
+            except Exception:
+                pass
+        return resp
 
     try:
         async with session_lock:
