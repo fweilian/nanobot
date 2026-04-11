@@ -110,15 +110,23 @@ class SessionManager:
         cloud_config: "CloudStorageConfig | None" = None,
     ):
         self._base_workspace = workspace
-        user_id = get_current_user_id()
-        self.workspace = workspace / "workspaces" / user_id if user_id else workspace
-        self._storage = create_storage(cloud_config, self.workspace)
+        self._cloud_config = cloud_config
+        # Storage is created lazily per-operation to use current user_id
+        self._storage: "CloudStorage | None" = None
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
+
+    def _get_current_storage(self) -> "CloudStorage":
+        """Get storage instance for current user context."""
+        # Always use base_workspace since _get_session_key already includes user path
+        return create_storage(self._cloud_config, self._base_workspace)
 
     def _get_session_key(self, key: str) -> str:
         """Get the storage key for a session."""
         safe_key = safe_filename(key.replace(":", "_"))
+        user_id = get_current_user_id()
+        if user_id:
+            return f"workspaces/{user_id}/sessions/{safe_key}.jsonl"
         return f"sessions/{safe_key}.jsonl"
 
     def _get_legacy_session_path(self, key: str) -> Path:
@@ -129,17 +137,17 @@ class SessionManager:
     def _read_session_bytes(self, key: str) -> bytes | None:
         """Read session bytes from storage, return None if not found."""
         try:
-            return self._storage.read(self._get_session_key(key))
+            return self._get_current_storage().read(self._get_session_key(key))
         except FileNotFoundError:
             return None
 
     def _write_session_bytes(self, key: str, data: bytes) -> None:
         """Write session bytes to storage."""
-        self._storage.write(self._get_session_key(key), data)
+        self._get_current_storage().write(self._get_session_key(key), data)
 
     def _session_exists(self, key: str) -> bool:
         """Check if session exists in storage."""
-        return self._storage.exists(self._get_session_key(key))
+        return self._get_current_storage().exists(self._get_session_key(key))
 
     def get_or_create(self, key: str) -> Session:
         """
@@ -233,14 +241,17 @@ class SessionManager:
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """
-        List all sessions.
+        List all sessions for the current user context.
 
         Returns:
             List of session info dicts.
         """
         sessions = []
+        user_id = get_current_user_id()
+        prefix = f"workspaces/{user_id}/sessions/" if user_id else "sessions/"
+        storage = self._get_current_storage()
         try:
-            keys = self._storage.list("sessions/")
+            keys = storage.list(prefix)
         except Exception:
             return []
 
@@ -248,7 +259,7 @@ class SessionManager:
             if not key.endswith(".jsonl"):
                 continue
             try:
-                data = self._storage.read(f"sessions/{key}")
+                data = storage.read(f"{prefix}{key}")
                 if not data:
                     continue
                 lines = data.decode("utf-8").split("\n")

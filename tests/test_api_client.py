@@ -8,7 +8,7 @@ API_URL = "http://localhost:18792/v1/chat/completions"
 
 
 def main():
-    payload = {"userId": "user123"}
+    payload = {"userId": "user1234"}
     token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
     print(f"Token: {token[:50]}...")
 
@@ -42,8 +42,9 @@ def main():
         headers=headers,
         json={
             "model": "MiniMax-M2.7",
-            "messages": [{"role": "user", "content": "今天杭州的天气如何"}],
+            "messages": [{"role": "user", "content": "明天杭州的天气如何"}],
             "stream": True,
+            "session_id": "1234566"
         },
         stream=True,
     ) as r:
