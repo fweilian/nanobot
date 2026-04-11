@@ -10,6 +10,7 @@ import asyncio
 import json
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
@@ -25,6 +26,7 @@ API_CHAT_ID = "default"
 # ---------------------------------------------------------------------------
 # Response helpers
 # ---------------------------------------------------------------------------
+
 
 def _error_json(status: int, message: str, err_type: str = "invalid_request_error") -> web.Response:
     return web.json_response(
@@ -58,12 +60,15 @@ def _sse_chunk(
     created: int,
     role_sent: bool,
     finish_reason: str | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
 ) -> bytes:
     delta: dict[str, Any] = {}
     if not role_sent:
         delta["role"] = "assistant"
     if content:
         delta["content"] = content
+    if tool_calls:
+        delta["tool_calls"] = tool_calls
     choice = {"index": 0, "delta": delta, "finish_reason": finish_reason}
     chunk = {
         "id": completion_id,
@@ -91,6 +96,7 @@ def _response_text(value: Any) -> str:
 # ---------------------------------------------------------------------------
 # Route handlers
 # ---------------------------------------------------------------------------
+
 
 async def handle_chat_completions(request: web.Request) -> web.Response:
     """POST /v1/chat/completions"""
@@ -150,6 +156,8 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
         async def sse_finalize(*, resuming: bool = False) -> None:
             nonlocal finalized, role_sent
+            if resuming:
+                return
             if finalized:
                 return
             finalized = True
@@ -174,6 +182,23 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             if finalized or not delta:
                 return
             try:
+                # Check for tool_calls data (prefixed with __tool_calls__:)
+                if delta.startswith("__tool_calls__:"):
+                    tool_calls_json = delta[len("__tool_calls__:") :]
+                    tool_calls_data = json.loads(tool_calls_json)
+                    await resp.write(
+                        _sse_chunk(
+                            "",
+                            completion_id=completion_id,
+                            model=model_name,
+                            created=created,
+                            role_sent=role_sent,
+                            finish_reason="tool_calls",
+                            tool_calls=tool_calls_data,
+                        )
+                    )
+                    role_sent = True
+                    return
                 await resp.write(
                     _sse_chunk(
                         delta,
@@ -289,17 +314,19 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 async def handle_models(request: web.Request) -> web.Response:
     """GET /v1/models"""
     model_name = request.app.get("model_name", "nanobot")
-    return web.json_response({
-        "object": "list",
-        "data": [
-            {
-                "id": model_name,
-                "object": "model",
-                "created": 0,
-                "owned_by": "nanobot",
-            }
-        ],
-    })
+    return web.json_response(
+        {
+            "object": "list",
+            "data": [
+                {
+                    "id": model_name,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "nanobot",
+                }
+            ],
+        }
+    )
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -311,7 +338,15 @@ async def handle_health(request: web.Request) -> web.Response:
 # App factory
 # ---------------------------------------------------------------------------
 
-def create_app(agent_loop, *, jwt_secret: str = "", model_name: str = "nanobot", request_timeout: float = 120.0, workspace: "Path | None" = None) -> web.Application:
+
+def create_app(
+    agent_loop,
+    *,
+    jwt_secret: str = "",
+    model_name: str = "nanobot",
+    request_timeout: float = 120.0,
+    workspace: "Path | None" = None,
+) -> web.Application:
     """Create the aiohttp application.
 
     Args:
@@ -320,13 +355,15 @@ def create_app(agent_loop, *, jwt_secret: str = "", model_name: str = "nanobot",
         request_timeout: Per-request timeout in seconds.
         workspace: Base workspace path for user workspace isolation.
     """
+    from nanobot.api.middleware import WORKSPACE_KEY
+
     app = web.Application()
     app["agent_loop"] = agent_loop
     app["model_name"] = model_name
     app["request_timeout"] = request_timeout
     app["session_locks"] = {}  # per-user locks, keyed by session_key
     if workspace is not None:
-        app["workspace"] = workspace
+        app[WORKSPACE_KEY] = workspace
     if jwt_secret:
         app.middlewares.append(JWTAuthMiddleware(jwt_secret))
 

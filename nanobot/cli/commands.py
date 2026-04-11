@@ -554,6 +554,13 @@ def serve(
     session_manager = SessionManager(
         runtime_config.workspace_path, cloud_config=runtime_config.cloud_storage
     )
+
+    # Create cron service with workspace-scoped store
+    from nanobot.cron.service import CronService
+
+    cron_store_path = runtime_config.workspace_path / "cron" / "jobs.json"
+    cron = CronService(cron_store_path, cloud_config=runtime_config.cloud_storage)
+
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
@@ -572,6 +579,24 @@ def serve(
         channels_config=runtime_config.channels,
         timezone=runtime_config.agents.defaults.timezone,
         cloud_config=runtime_config.cloud_storage,
+        cron_service=cron,
+    )
+
+    # Configure Dream system job
+    dream_cfg = runtime_config.agents.defaults.dream
+    if dream_cfg.model_override:
+        agent_loop.dream.model = dream_cfg.model_override
+    agent_loop.dream.max_batch_size = dream_cfg.max_batch_size
+    agent_loop.dream.max_iterations = dream_cfg.max_iterations
+    from nanobot.cron.types import CronJob, CronPayload
+
+    cron.register_system_job(
+        CronJob(
+            id="dream",
+            name="dream",
+            schedule=dream_cfg.build_schedule(runtime_config.agents.defaults.timezone),
+            payload=CronPayload(kind="system_event"),
+        )
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -582,7 +607,9 @@ def serve(
     console.print(f"  [cyan]Timeout[/cyan]  : {timeout}s")
     jwt_secret = runtime_config.jwt.secret if runtime_config.jwt else ""
     if not jwt_secret:
-        console.print("[red]Error:[/red] JWT secret is required for API server. Set 'jwt.secret' in config.")
+        console.print(
+            "[red]Error:[/red] JWT secret is required for API server. Set 'jwt.secret' in config."
+        )
         raise typer.Exit(1)
     console.print("  [cyan]JWT[/cyan]     : enabled")
     if host in {"0.0.0.0", "::"}:
@@ -592,16 +619,30 @@ def serve(
         )
     console.print()
 
-    api_app = create_app(agent_loop, jwt_secret=jwt_secret, model_name=model_name, request_timeout=timeout, workspace=agent_loop.workspace)
+    api_app = create_app(
+        agent_loop,
+        jwt_secret=jwt_secret,
+        model_name=model_name,
+        request_timeout=timeout,
+        workspace=agent_loop.workspace,
+    )
 
     async def on_startup(_app):
         await agent_loop._connect_mcp()
+        await cron.start()
 
     async def on_cleanup(_app):
         await agent_loop.close_mcp()
+        cron.stop()
 
     api_app.on_startup.append(on_startup)
     api_app.on_cleanup.append(on_cleanup)
+
+    cron_status = cron.status()
+    if cron_status["jobs"] > 0:
+        console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
+    else:
+        console.print("[green]✓[/green] Cron: no scheduled jobs")
 
     web.run_app(api_app, host=host, port=port, print=lambda msg: logger.info(msg))
 

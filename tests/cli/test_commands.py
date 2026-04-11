@@ -585,6 +585,8 @@ def _patch_serve_runtime(monkeypatch, config: Config, seen: dict[str, object]) -
         def __init__(self, **kwargs) -> None:
             self.workspace = kwargs.get("workspace", Path("/fake/workspace"))
             seen["workspace"] = kwargs["workspace"]
+            # Mock dream attribute for cron-related code
+            self.dream = type("Dream", (), {})()
 
         async def _connect_mcp(self) -> None:
             return None

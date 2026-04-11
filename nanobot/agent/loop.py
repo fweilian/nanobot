@@ -95,8 +95,12 @@ class _LoopHook(AgentHook):
                 )
                 if thought:
                     await self._on_progress(thought)
-            tool_hint = self._loop._strip_think(self._loop._tool_hint(context.tool_calls))
-            await self._on_progress(tool_hint, tool_hint=True)
+                tool_hint = self._loop._strip_think(self._loop._tool_hint(context.tool_calls))
+                await self._on_progress(tool_hint, tool_hint=True)
+            elif self._on_stream and context.tool_calls:
+                # In streaming mode, send tool_calls data for SSE output
+                tool_calls_data = [tc.to_openai_tool_call() for tc in context.tool_calls]
+                await self._on_stream(f"__tool_calls__:{json.dumps(tool_calls_data)}")
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
