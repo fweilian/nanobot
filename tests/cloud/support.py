@@ -16,6 +16,14 @@ class MemoryStore:
         normalized = prefix.rstrip("/") + "/"
         return sorted(key for key in self.data if key.startswith(normalized))
 
+    def list_entries(self, prefix: str) -> list[tuple[str, int]]:
+        normalized = prefix.rstrip("/") + "/"
+        return sorted(
+            (key, len(value))
+            for key, value in self.data.items()
+            if key.startswith(normalized)
+        )
+
     def get_bytes(self, key: str) -> bytes:
         return self.data[key]
 

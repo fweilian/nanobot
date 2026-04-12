@@ -639,3 +639,85 @@ This real WSL2 validation confirmed:
 - Redis online session keys
 - MinIO durable session files
 - successful post-restart chat continuation
+
+## Staging Checklist
+
+Use this PASS/FAIL checklist for repeatable staging validation.
+
+| Category | Check | Method | Expected | Pass/Fail |
+| --- | --- | --- | --- | --- |
+| Base | Redis reachable | `PING` / app startup | Connects successfully |  |
+| Base | S3/MinIO reachable | bucket list / app startup | Connects successfully |  |
+| Base | `platform-config.json` valid | start service | Service boots without config error |  |
+| Base | `/health` | `GET /health` | `200`, `{"status":"ok"}` |  |
+| Base | `/v1/models` | `GET /v1/models` | `200`, platform model returned |  |
+| Auth | Bearer token valid | `GET /v1/agents` with valid token | `200` |  |
+| Auth | Missing token rejected | `GET /v1/agents` without token | `401` |  |
+| Auth | Invalid token rejected | `GET /v1/agents` with bad token | `401` |  |
+| Bootstrap | First login creates workspace | first `GET /v1/agents` for new user | user workspace appears in S3 |  |
+| Bootstrap | First login creates default agent | first `GET /v1/agents` | `default` agent present |  |
+| Chat | Non-streaming chat works | `POST /v1/chat/completions` | `200`, assistant content returned |  |
+| Chat | Streaming chat works | `POST /v1/chat/completions` with `stream=true` | SSE stream + `[DONE]` |  |
+| Isolation | Two users can both chat | Alice + Bob requests | both succeed |  |
+| Isolation | Same raw `session_id` is isolated per user | Alice/Bob use same `session_id` | separate session state |  |
+| Session | Redis online session created | inspect Redis keys | session key exists per `user+agent+session` |  |
+| Session | S3 durable session file created | inspect S3 prefix | session `.jsonl` file exists |  |
+| Restart | Service restart preserves session continuity | stop/start service, re-chat same session | same user/session continues successfully |  |
+| Locking | Concurrent write conflict | send 2 writes to same `user+agent+session` | one success, one `409 session_locked` |  |
+| Budget | Non-stream budget exceeded path | set tiny skill budget, call non-stream chat | `507 skill_stage_budget_exceeded` |  |
+| Budget | Stream budget exceeded path | set tiny skill budget, call `stream=true` | deterministic error, no server crash |  |
+| Skills | Small skill runs correctly | attach small skill to agent and chat | expected behavior |  |
+| Skills | Small skill can reuse cache | repeat same request | behavior unchanged, lower remote fetches if measured |  |
+| Skills | Large skill runs correctly | attach large skill to agent and chat | expected behavior |  |
+| Skills | Large skill not stored as Redis full-content cache by default | inspect Redis keys/size | no large bundle content retention |  |
+| Skills | Missing skill non-stream | reference missing skill | deterministic error (`404`) |  |
+| Skills | Missing skill stream | reference missing skill with `stream=true` | deterministic error, no `response already started` crash |  |
+| Skills | Immutable bundle consistency | same skill on 2 instances | same bundle revision/object set |  |
+| Local FS | Request temp dirs cleaned up | inspect local cache dir after request | temp dirs removed |  |
+| Local FS | Local disk budget respected | monitor local cache usage under load | does not exceed configured bounds |  |
+| Metrics | S3 fetch metrics visible | logs/metrics | request/object counts visible |  |
+| Metrics | Redis skill/session metrics visible | logs/metrics | key counts / bytes / hits visible |  |
+| Regression | Existing OpenAI API tests still pass in CI | run regression suite | pass |  |
+
+### Suggested Evidence To Save
+
+- service startup logs
+- one successful non-stream response
+- one successful stream transcript
+- Redis key snapshot
+- S3 object listing for two users
+- one `409 session_locked` response
+- one `507 skill_stage_budget_exceeded` response
+- post-restart successful chat response
+
+### Minimal Commands
+
+Health:
+
+```bash
+curl http://127.0.0.1:8890/health
+```
+
+Models:
+
+```bash
+curl http://127.0.0.1:8890/v1/models
+```
+
+Agents:
+
+```bash
+curl -H "Authorization: Bearer <token>" http://127.0.0.1:8890/v1/agents
+```
+
+Real end-to-end flow:
+
+```bash
+uv run --extra cloud python test_cloud_api.py \
+  --platform-config /path/to/platform-config.json \
+  --redis-url redis://:PASSWORD@HOST:6379/0 \
+  --s3-endpoint-url http://HOST:9000 \
+  --s3-access-key-id ACCESS_KEY \
+  --s3-secret-access-key SECRET_KEY \
+  --s3-bucket BUCKET
+```

@@ -87,6 +87,15 @@ class RedisSettings(BaseModel):
     lock_ttl_s: int = 5 * 60
 
 
+class SkillCacheSettings(BaseModel):
+    """Skill cache settings for request-scoped staging."""
+
+    small_skill_max_bytes: int = 64 * 1024
+    request_stage_budget_bytes: int = 8 * 1024 * 1024
+    instance_stage_budget_bytes: int = 32 * 1024 * 1024
+    redis_content_ttl_s: int = 24 * 60 * 60
+
+
 class CloudServiceSettings(BaseSettings):
     """Service settings loaded from .env / environment."""
 
@@ -105,6 +114,7 @@ class CloudServiceSettings(BaseSettings):
     workspace_prefix: str = "workspaces"
     auth: AuthSettings
     redis: RedisSettings = Field(default_factory=RedisSettings)
+    skill_cache: SkillCacheSettings = Field(default_factory=SkillCacheSettings)
     s3: S3Settings
 
     @property

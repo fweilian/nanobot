@@ -16,6 +16,7 @@ from nanobot.cloud.config import (
 from nanobot.cloud.runtime import CloudChatResult, CloudRuntimeService, CloudWorkspaceManager
 from nanobot.cloud.server import create_app
 from nanobot.cloud.session_store import session_file_path
+from nanobot.cloud.skills_cache import SkillStageBudgetExceededError
 from tests.cloud.support import InMemoryLockManager, InMemorySessionStore, MemoryStore
 
 
@@ -153,6 +154,31 @@ def test_streaming_unknown_agent_returns_404(client):
     assert resp.status_code == 404
 
 
+def test_streaming_missing_skill_returns_404_before_stream_starts(client, monkeypatch):
+    runtime_service = client.app.state.runtime_service
+    original = runtime_service.load_agent_metadata
+
+    def fake_load_agent_metadata(user_id: str, agent_name: str):
+        agent = original(user_id, agent_name)
+        agent.skills = ["missing-skill"]
+        return agent
+
+    monkeypatch.setattr(runtime_service, "load_agent_metadata", fake_load_agent_metadata)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer token"},
+        json={
+            "agent": "default",
+            "session_id": "thread-1",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert resp.status_code == 404
+
+
 def test_conflicting_chat_request_returns_409(client):
     lock_manager = client.app.state.runtime_service.lock_manager
     scope = client.app.state.runtime_service._lock_scope("alice", "default", "thread-1")
@@ -172,6 +198,82 @@ def test_conflicting_chat_request_returns_409(client):
 
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "session_locked"
+
+
+def test_budget_exceeded_returns_507_for_non_stream(client, monkeypatch):
+    async def fail(*args, **kwargs):
+        raise SkillStageBudgetExceededError(
+            requested_bytes=200,
+            request_budget_bytes=100,
+            instance_budget_bytes=1000,
+            current_instance_bytes=0,
+        )
+
+    monkeypatch.setattr(client.app.state.runtime_service, "reserve_chat_execution", fail)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer token"},
+        json={
+            "agent": "default",
+            "session_id": "thread-1",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert resp.status_code == 507
+    assert resp.json()["error"]["code"] == "skill_stage_budget_exceeded"
+
+
+def test_budget_exceeded_returns_507_for_stream(client, monkeypatch):
+    async def fail(*args, **kwargs):
+        raise SkillStageBudgetExceededError(
+            requested_bytes=200,
+            request_budget_bytes=100,
+            instance_budget_bytes=1000,
+            current_instance_bytes=0,
+        )
+
+    monkeypatch.setattr(client.app.state.runtime_service, "reserve_chat_execution", fail)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer token"},
+        json={
+            "agent": "default",
+            "session_id": "thread-1",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert resp.status_code == 507
+    assert resp.json()["error"]["code"] == "skill_stage_budget_exceeded"
+
+
+def test_streaming_post_start_failure_returns_sse_error_event(client, monkeypatch):
+    runtime_service = client.app.state.runtime_service
+
+    async def fail(*args, **kwargs):
+        raise FileNotFoundError("missing during stream")
+
+    monkeypatch.setattr(runtime_service, "run_chat", fail)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer token"},
+        json={
+            "agent": "default",
+            "session_id": "thread-1",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert "not_found" in resp.text
+    assert "missing during stream" in resp.text
+    assert "data: [DONE]" in resp.text
 
 
 @pytest.fixture

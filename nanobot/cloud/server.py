@@ -22,6 +22,11 @@ from nanobot.cloud.config import CloudServiceSettings, ManagedProviderView
 from nanobot.cloud.lock import CloudSessionLockedError, RedisDistributedLockManager
 from nanobot.cloud.runtime import CloudRuntimeService, CloudWorkspaceManager
 from nanobot.cloud.session_store import RedisSessionStore
+from nanobot.cloud.skills_cache import (
+    RedisSkillBundleStore,
+    SkillStageBudgetExceededError,
+    SkillStageBudgetManager,
+)
 from nanobot.cloud.storage import S3ObjectStore
 from nanobot.config.loader import load_config, resolve_config_env_vars
 
@@ -95,6 +100,17 @@ def _chunk(content: str | None, model: str, *, finish_reason: str | None = None,
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _sse_error(code: str, message: str, *, retryable: bool) -> str:
+    payload = {
+        "error": {
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+        }
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 def build_runtime_service(settings: CloudServiceSettings) -> CloudRuntimeService:
     """Build the main cloud runtime service from settings."""
     from redis.asyncio import Redis
@@ -131,6 +147,15 @@ def build_runtime_service(settings: CloudServiceSettings) -> CloudRuntimeService
         lock_manager=RedisDistributedLockManager(
             redis_client,
             key_prefix=settings.redis.key_prefix,
+        ),
+        skill_bundle_store=RedisSkillBundleStore(
+            redis_client,
+            key_prefix=settings.redis.key_prefix,
+            ttl_s=settings.skill_cache.redis_content_ttl_s,
+        ),
+        skill_stage_budget=SkillStageBudgetManager(
+            request_budget_bytes=settings.skill_cache.request_stage_budget_bytes,
+            instance_budget_bytes=settings.skill_cache.instance_stage_budget_bytes,
         ),
     )
 
@@ -178,6 +203,23 @@ def create_app(
                 }
             },
             status_code=status.HTTP_409_CONFLICT,
+        )
+
+    def _skill_stage_budget_response(exc: SkillStageBudgetExceededError) -> JSONResponse:
+        return JSONResponse(
+            {
+                "error": {
+                    "message": "Skill staging exceeds local cache budget for this instance.",
+                    "type": "capacity_error",
+                    "code": "skill_stage_budget_exceeded",
+                    "retryable": True,
+                    "requestedBytes": exc.requested_bytes,
+                    "requestBudgetBytes": exc.request_budget_bytes,
+                    "instanceBudgetBytes": exc.instance_budget_bytes,
+                    "currentInstanceBytes": exc.current_instance_bytes,
+                }
+            },
+            status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
         )
 
     @app.get("/health")
@@ -232,12 +274,13 @@ def create_app(
             )
         content = _last_user_text(body.messages)
         try:
-            await service.ensure_agent(user, body.agent)
+            reservation = await service.reserve_chat_execution(user.user_id, body.agent, body.session_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-        lock_token = await service.acquire_chat_lock(user.user_id, body.agent, body.session_id)
-        if lock_token is None:
+        except CloudSessionLockedError:
             return _session_locked_response()
+        except SkillStageBudgetExceededError as exc:
+            return _skill_stage_budget_response(exc)
 
         if not body.stream:
             try:
@@ -246,10 +289,12 @@ def create_app(
                     agent_name=body.agent,
                     session_id=body.session_id,
                     content=content,
-                    lock_token=lock_token,
+                    reservation=reservation,
                 )
             except CloudSessionLockedError:
                 return _session_locked_response()
+            except SkillStageBudgetExceededError as exc:
+                return _skill_stage_budget_response(exc)
             except FileNotFoundError as exc:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
             return JSONResponse(_completion_response(result.content, result.model))
@@ -270,7 +315,7 @@ def create_app(
                     agent_name=body.agent,
                     session_id=body.session_id,
                     content=content,
-                    lock_token=lock_token,
+                    reservation=reservation,
                     on_stream=_on_stream,
                     on_stream_end=_on_stream_end,
                 )
@@ -280,7 +325,16 @@ def create_app(
             try:
                 while True:
                     if task.done() and queue.empty():
-                        result = await task
+                        try:
+                            result = await task
+                        except FileNotFoundError as exc:
+                            yield _sse_error("not_found", str(exc), retryable=False)
+                            yield "data: [DONE]\n\n"
+                            break
+                        except Exception:
+                            yield _sse_error("server_error", "Streaming execution failed.", retryable=False)
+                            yield "data: [DONE]\n\n"
+                            break
                         if not started:
                             yield _chunk("", model_name, include_role=True)
                             started = True
@@ -298,23 +352,26 @@ def create_app(
                     if kind == "delta":
                         yield _chunk(payload or "", model_name)
                         continue
-                    result = await task
+                    try:
+                        result = await task
+                    except FileNotFoundError as exc:
+                        yield _sse_error("not_found", str(exc), retryable=False)
+                        yield "data: [DONE]\n\n"
+                        break
+                    except Exception:
+                        yield _sse_error("server_error", "Streaming execution failed.", retryable=False)
+                        yield "data: [DONE]\n\n"
+                        break
                     model_name = result.model
                     yield _chunk(None, model_name, finish_reason="stop")
                     yield "data: [DONE]\n\n"
                     break
-            except CloudSessionLockedError:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail={
-                        "code": "session_locked",
-                        "message": "Another write request is already in progress for this session.",
-                        "retryable": True,
-                    },
-                )
-            except FileNotFoundError as exc:
+            except (CloudSessionLockedError, SkillStageBudgetExceededError, FileNotFoundError):
                 task.cancel()
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+                raise
+            except Exception:
+                task.cancel()
+                raise
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 

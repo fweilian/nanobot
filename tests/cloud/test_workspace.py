@@ -6,9 +6,10 @@ from pathlib import Path
 import pytest
 
 from nanobot.cloud.auth import AuthenticatedUser
-from nanobot.cloud.config import ManagedProviderView
+from nanobot.cloud.config import ManagedProviderView, SkillCacheSettings
 from nanobot.cloud.runtime import CloudChatResult, CloudRuntimeService, CloudWorkspaceManager
 from nanobot.cloud.session_store import InMemorySessionStore, session_file_path
+from nanobot.cloud.skills_cache import InMemorySkillBundleStore
 from tests.cloud.support import InMemoryLockManager, MemoryStore
 
 
@@ -33,7 +34,36 @@ def test_first_login_bootstraps_workspace(tmp_path: Path):
         manager.cleanup_workspace(root)
 
 
-def test_runtime_materialization_only_keeps_selected_skills(tmp_path: Path):
+def test_first_login_workspace_estimate_is_non_zero(tmp_path: Path):
+    manager = CloudWorkspaceManager(
+        store=MemoryStore(),
+        cache_root=tmp_path,
+        workspace_prefix="workspaces",
+        platform_provider=ManagedProviderView(provider="openrouter", model="openai/gpt-4.1"),
+    )
+
+    assert manager.estimate_workspace_bytes("alice") > 0
+
+
+def test_first_login_workspace_estimate_covers_materialized_workspace(tmp_path: Path):
+    manager = CloudWorkspaceManager(
+        store=MemoryStore(),
+        cache_root=tmp_path,
+        workspace_prefix="workspaces",
+        platform_provider=ManagedProviderView(provider="openrouter", model="openai/gpt-4.1"),
+    )
+
+    estimated = manager.estimate_workspace_bytes("alice")
+    root = manager.ensure_user_workspace("alice")
+    try:
+        actual = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+        assert estimated >= actual
+    finally:
+        manager.cleanup_workspace(root)
+
+
+@pytest.mark.asyncio
+async def test_runtime_materialization_only_keeps_selected_skills(tmp_path: Path):
     manager = CloudWorkspaceManager(
         store=MemoryStore(),
         cache_root=tmp_path,
@@ -50,18 +80,24 @@ def test_runtime_materialization_only_keeps_selected_skills(tmp_path: Path):
         agent.skills = ["local-skill"]
         manager.save_agent_config(root, agent)
 
-        runtime_dir, builtin_dir, selected_skills_dir = manager.create_runtime_workspace(root, agent)
+        runtime_dir, builtin_dir, selected_skills_dir, total_bytes = await manager.create_runtime_workspace(
+            root,
+            agent,
+            bundle_store=InMemorySkillBundleStore(),
+        )
         try:
             assert (selected_skills_dir / "local-skill" / "SKILL.md").exists()
             assert not (runtime_dir / "skills" / "local-skill" / "SKILL.md").exists()
             assert list(builtin_dir.iterdir()) == []
+            assert total_bytes > 0
         finally:
             shutil_rmtree(runtime_dir)
     finally:
         manager.cleanup_workspace(root)
 
 
-def test_runtime_persist_propagates_deletions_and_skill_edits(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_runtime_persist_propagates_deletions_and_skill_edits(tmp_path: Path):
     store = MemoryStore()
     manager = CloudWorkspaceManager(
         store=store,
@@ -82,7 +118,11 @@ def test_runtime_persist_propagates_deletions_and_skill_edits(tmp_path: Path):
         agent = manager.load_agent_config(root, "default")
         agent.skills = ["workspace-skill"]
         manager.save_agent_config(root, agent)
-        runtime_dir, _, selected_skills_dir = manager.create_runtime_workspace(root, agent)
+        runtime_dir, _, selected_skills_dir, _ = await manager.create_runtime_workspace(
+            root,
+            agent,
+            bundle_store=InMemorySkillBundleStore(),
+        )
         try:
             (runtime_dir / "notes.txt").unlink()
             (selected_skills_dir / "workspace-skill" / "SKILL.md").write_text("# after", encoding="utf-8")
@@ -133,7 +173,8 @@ def test_effective_config_applies_agent_overrides(tmp_path: Path):
     assert effective.agents.defaults.timezone == "Asia/Shanghai"
 
 
-def test_runtime_workspace_hides_unselected_skills(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_runtime_workspace_hides_unselected_skills(tmp_path: Path):
     manager = CloudWorkspaceManager(
         store=MemoryStore(),
         cache_root=tmp_path,
@@ -150,7 +191,11 @@ def test_runtime_workspace_hides_unselected_skills(tmp_path: Path):
         agent.skills = []
         manager.save_agent_config(root, agent)
 
-        runtime_dir, _, selected_skills_dir = manager.create_runtime_workspace(root, agent)
+        runtime_dir, _, selected_skills_dir, _ = await manager.create_runtime_workspace(
+            root,
+            agent,
+            bundle_store=InMemorySkillBundleStore(),
+        )
         try:
             assert not (runtime_dir / "skills" / "workspace-skill" / "SKILL.md").exists()
             assert not list(selected_skills_dir.glob("*/SKILL.md"))
@@ -204,6 +249,7 @@ async def test_multi_instance_flow_reuses_online_session(tmp_path: Path):
         {
             "request_timeout": 30,
             "redis": type("RedisCfg", (), {"lock_ttl_s": 30})(),
+            "skill_cache": SkillCacheSettings(),
         },
     )()
 
@@ -218,6 +264,7 @@ async def test_multi_instance_flow_reuses_online_session(tmp_path: Path):
         platform_config_path=settings_path,
         session_store=session_store,
         lock_manager=lock_manager,
+        skill_bundle_store=InMemorySkillBundleStore(),
         executor=executor,
     )
     service_b = CloudRuntimeService(
@@ -231,28 +278,27 @@ async def test_multi_instance_flow_reuses_online_session(tmp_path: Path):
         platform_config_path=settings_path,
         session_store=session_store,
         lock_manager=lock_manager,
+        skill_bundle_store=InMemorySkillBundleStore(),
         executor=executor,
     )
     user = AuthenticatedUser(user_id="alice", claims={"sub": "alice"}, token="t")
 
-    token_a = await service_a.acquire_chat_lock("alice", "default", "thread-1")
-    assert token_a is not None
+    reservation_a = await service_a.reserve_chat_execution("alice", "default", "thread-1")
     await service_a.run_chat(
         user=user,
         agent_name="default",
         session_id="thread-1",
         content="hello",
-        lock_token=token_a,
+        reservation=reservation_a,
     )
 
-    token_b = await service_b.acquire_chat_lock("alice", "default", "thread-1")
-    assert token_b is not None
+    reservation_b = await service_b.reserve_chat_execution("alice", "default", "thread-1")
     await service_b.run_chat(
         user=user,
         agent_name="default",
         session_id="thread-1",
         content=" world",
-        lock_token=token_b,
+        reservation=reservation_b,
     )
 
     assert observed_contents[0] == ""

@@ -14,6 +14,8 @@ class ObjectStore(Protocol):
 
     def list_keys(self, prefix: str) -> list[str]: ...
 
+    def list_entries(self, prefix: str) -> list[tuple[str, int]]: ...
+
     def get_bytes(self, key: str) -> bytes: ...
 
     def put_bytes(self, key: str, data: bytes) -> None: ...
@@ -59,16 +61,19 @@ class S3ObjectStore:
             return False
 
     def list_keys(self, prefix: str) -> list[str]:
+        return [key for key, _ in self.list_entries(prefix)]
+
+    def list_entries(self, prefix: str) -> list[tuple[str, int]]:
         full_prefix = self._full_key(prefix).rstrip("/") + "/"
         paginator = self._client.get_paginator("list_objects_v2")
-        keys: list[str] = []
+        entries: list[tuple[str, int]] = []
         for page in paginator.paginate(Bucket=self.bucket, Prefix=full_prefix):
             for item in page.get("Contents", []):
                 raw = item["Key"]
                 if self.prefix:
                     raw = raw[len(self.prefix) + 1:]
-                keys.append(raw)
-        return keys
+                entries.append((raw, int(item.get("Size", 0))))
+        return entries
 
     def get_bytes(self, key: str) -> bytes:
         response = self._client.get_object(Bucket=self.bucket, Key=self._full_key(key))

@@ -20,6 +20,13 @@ from nanobot.cloud.auth import AuthenticatedUser
 from nanobot.cloud.config import CloudAgentConfig, utc_now_iso
 from nanobot.cloud.lock import CloudSessionLockedError
 from nanobot.cloud.session_store import OnlineSessionStore, session_file_path
+from nanobot.cloud.skills_cache import (
+    PreparedSkillBundle,
+    SkillBundleContentStore,
+    SkillStageBudgetManager,
+    build_skill_bundle,
+    load_or_populate_bundle_content,
+)
 from nanobot.cloud.workspace_sync import RequestWorkspaceManager
 from nanobot.nanobot import _make_provider
 
@@ -30,6 +37,16 @@ class CloudChatResult:
 
     content: str
     model: str
+
+
+@dataclass(slots=True)
+class ReservedChatExecution:
+    """Reserved execution resources for a chat request."""
+
+    lock_scope: str
+    lock_token: str
+    reserved_bytes: int
+    agent: CloudAgentConfig
 
 
 class CloudContextBuilder(ContextBuilder):
@@ -163,14 +180,64 @@ class CloudAgentLoop(AgentLoop):
 class CloudWorkspaceManager(RequestWorkspaceManager):
     """Request-scoped cloud workspace manager with runtime materialization."""
 
-    def create_runtime_workspace(self, root: Path, agent: CloudAgentConfig) -> tuple[Path, Path, Path]:
+    def prepare_skill_bundles(
+        self,
+        root: Path,
+        agent: CloudAgentConfig,
+        *,
+        small_skill_max_bytes: int,
+    ) -> list[PreparedSkillBundle]:
+        bundles: list[PreparedSkillBundle] = []
+        agent_skill_root = root / "agents" / agent.name / "skills"
+        workspace_skill_root = root / "skills"
+        for skill in agent.skills:
+            builtin_path = BUILTIN_SKILLS_DIR / skill
+            agent_path = agent_skill_root / skill
+            workspace_path = workspace_skill_root / skill
+            if agent_path.exists():
+                bundles.append(build_skill_bundle(
+                    skill_name=skill,
+                    source_dir=agent_path,
+                    source_kind="agent",
+                    source=agent_path.as_posix(),
+                    relative_target=(Path("agents") / agent.name / "skills" / skill).as_posix(),
+                    small_skill_max_bytes=small_skill_max_bytes,
+                ))
+            elif workspace_path.exists():
+                bundles.append(build_skill_bundle(
+                    skill_name=skill,
+                    source_dir=workspace_path,
+                    source_kind="workspace",
+                    source=workspace_path.as_posix(),
+                    relative_target=(Path("skills") / skill).as_posix(),
+                    small_skill_max_bytes=small_skill_max_bytes,
+                ))
+            elif builtin_path.exists():
+                bundles.append(build_skill_bundle(
+                    skill_name=skill,
+                    source_dir=builtin_path,
+                    source_kind="builtin",
+                    source=builtin_path.as_posix(),
+                    relative_target=None,
+                    small_skill_max_bytes=small_skill_max_bytes,
+                ))
+            else:
+                raise FileNotFoundError(f"Unknown skill '{skill}' for agent '{agent.name}'")
+        return bundles
+
+    async def create_runtime_workspace(
+        self,
+        root: Path,
+        agent: CloudAgentConfig,
+        bundles: list[PreparedSkillBundle] | None = None,
+        bundle_store: SkillBundleContentStore | None = None,
+    ) -> tuple[Path, Path, Path, int]:
         runtime_dir = Path(tempfile.mkdtemp(prefix=f"{agent.name}-", dir=root.parent))
         shutil.copytree(root, runtime_dir, dirs_exist_ok=True)
         selected_builtin_dir = runtime_dir / ".cloud_builtin_skills"
         selected_builtin_dir.mkdir(parents=True, exist_ok=True)
         selected_skills_dir = runtime_dir / ".cloud_selected_skills"
         selected_skills_dir.mkdir(parents=True, exist_ok=True)
-        skill_manifest: dict[str, str] = {}
 
         runtime_skills = runtime_dir / "skills"
         if runtime_skills.exists():
@@ -179,27 +246,38 @@ class CloudWorkspaceManager(RequestWorkspaceManager):
             if path.exists():
                 shutil.rmtree(path)
 
-        agent_skill_root = root / "agents" / agent.name / "skills"
-        workspace_skill_root = root / "skills"
-        for skill in agent.skills:
-            builtin_path = BUILTIN_SKILLS_DIR / skill
-            agent_path = agent_skill_root / skill
-            workspace_path = workspace_skill_root / skill
-            if agent_path.exists():
-                shutil.copytree(agent_path, selected_skills_dir / skill, dirs_exist_ok=True)
-                skill_manifest[skill] = (Path("agents") / agent.name / "skills" / skill).as_posix()
-            elif workspace_path.exists():
-                shutil.copytree(workspace_path, selected_skills_dir / skill, dirs_exist_ok=True)
-                skill_manifest[skill] = (Path("skills") / skill).as_posix()
-            elif builtin_path.exists():
-                shutil.copytree(builtin_path, selected_builtin_dir / skill, dirs_exist_ok=True)
+        bundles = bundles or self.prepare_skill_bundles(
+            root,
+            agent,
+            small_skill_max_bytes=64 * 1024,
+        )
+        total_skill_bytes = sum(bundle.manifest.total_bytes for bundle in bundles)
+        manifest_payload = {"skills": []}
+
+        for bundle in bundles:
+            target_root = selected_builtin_dir if bundle.manifest.source_kind == "builtin" else selected_skills_dir
+            skill_target = target_root / bundle.manifest.skill_name
+            if skill_target.exists():
+                shutil.rmtree(skill_target)
+            skill_target.mkdir(parents=True, exist_ok=True)
+
+            cached_files = None
+            if bundle_store is not None:
+                cached_files = await load_or_populate_bundle_content(bundle, bundle_store)
+            if cached_files is None:
+                shutil.copytree(bundle.source_dir, skill_target, dirs_exist_ok=True)
             else:
-                raise FileNotFoundError(f"Unknown skill '{skill}' for agent '{agent.name}'")
+                for rel_path, content in cached_files.items():
+                    fp = skill_target / rel_path
+                    fp.parent.mkdir(parents=True, exist_ok=True)
+                    fp.write_bytes(content)
+            manifest_payload["skills"].append(bundle.manifest.model_dump(mode="json"))
+
         (selected_skills_dir / "manifest.json").write_text(
-            json.dumps(skill_manifest, indent=2, ensure_ascii=False),
+            json.dumps(manifest_payload, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        return runtime_dir, selected_builtin_dir, selected_skills_dir
+        return runtime_dir, selected_builtin_dir, selected_skills_dir, total_skill_bytes
 
     def persist_runtime_workspace(self, root: Path, runtime_dir: Path) -> None:
         transient = {".cloud_builtin_skills", ".cloud_selected_skills", ".git"}
@@ -238,8 +316,11 @@ class CloudWorkspaceManager(RequestWorkspaceManager):
         manifest_path = runtime_dir / ".cloud_selected_skills" / "manifest.json"
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            for skill, relative_target in manifest.items():
-                staged = runtime_dir / ".cloud_selected_skills" / skill
+            for skill in manifest.get("skills", []):
+                relative_target = skill.get("relative_target")
+                if not relative_target:
+                    continue
+                staged = runtime_dir / ".cloud_selected_skills" / skill["skill_name"]
                 target = root / relative_target
                 if target.exists():
                     shutil.rmtree(target)
@@ -259,6 +340,8 @@ class CloudRuntimeService:
         platform_config_path: Path,
         session_store: OnlineSessionStore,
         lock_manager,
+        skill_bundle_store: SkillBundleContentStore | None = None,
+        skill_stage_budget: SkillStageBudgetManager | None = None,
         executor: Callable[..., Awaitable[CloudChatResult]] | None = None,
     ) -> None:
         from nanobot.config.loader import load_config, resolve_config_env_vars
@@ -270,6 +353,8 @@ class CloudRuntimeService:
         self.platform_model = self.platform_config.agents.defaults.model
         self.session_store = session_store
         self.lock_manager = lock_manager
+        self.skill_bundle_store = skill_bundle_store
+        self.skill_stage_budget = skill_stage_budget
         self._executor = executor or self._run_with_agent_loop
 
     async def list_agents(self, user: AuthenticatedUser) -> list[CloudAgentConfig]:
@@ -290,10 +375,78 @@ class CloudRuntimeService:
         finally:
             self.workspace_manager.cleanup_workspace(root)
 
+    def _default_agent(self) -> CloudAgentConfig:
+        return CloudAgentConfig(name="default")
+
+    def load_agent_metadata(self, user_id: str, agent_name: str) -> CloudAgentConfig:
+        workspace_cfg = self.workspace_manager.load_workspace_config_remote(user_id)
+        if workspace_cfg is None:
+            if agent_name != "default":
+                raise FileNotFoundError(agent_name)
+            return self._default_agent()
+        if agent_name not in workspace_cfg.agents:
+            raise FileNotFoundError(agent_name)
+        agent = self.workspace_manager.load_agent_config_remote(user_id, agent_name)
+        if agent is None:
+            raise FileNotFoundError(agent_name)
+        return agent
+
+    def validate_skill_sources(self, user_id: str, agent_name: str, agent: CloudAgentConfig) -> None:
+        for skill in agent.skills:
+            if BUILTIN_SKILLS_DIR.joinpath(skill).exists():
+                continue
+            if self.workspace_manager.skill_exists_remote(user_id, agent_name, skill):
+                continue
+            raise FileNotFoundError(f"Unknown skill '{skill}' for agent '{agent_name}'")
+
+    def estimate_request_local_bytes(self, user_id: str, agent: CloudAgentConfig) -> int:
+        workspace_bytes = self.workspace_manager.estimate_workspace_bytes(user_id)
+        builtin_bytes = 0
+        for skill in agent.skills:
+            builtin_path = BUILTIN_SKILLS_DIR / skill
+            if not builtin_path.exists():
+                continue
+            bundle = build_skill_bundle(
+                skill_name=skill,
+                source_dir=builtin_path,
+                source_kind="builtin",
+                source=builtin_path.as_posix(),
+                relative_target=None,
+                small_skill_max_bytes=self.settings.skill_cache.small_skill_max_bytes,
+            )
+            builtin_bytes += bundle.manifest.total_bytes
+        return (2 * workspace_bytes) + builtin_bytes
+
     async def acquire_chat_lock(self, user_id: str, agent_name: str, session_id: str) -> str | None:
         return await self.lock_manager.acquire(
             self._lock_scope(user_id, agent_name, session_id),
             self.settings.redis.lock_ttl_s,
+        )
+
+    async def reserve_chat_execution(
+        self,
+        user_id: str,
+        agent_name: str,
+        session_id: str,
+    ) -> ReservedChatExecution:
+        agent = self.load_agent_metadata(user_id, agent_name)
+        self.validate_skill_sources(user_id, agent_name, agent)
+        reserved_bytes = self.estimate_request_local_bytes(user_id, agent)
+        lock_scope = self._lock_scope(user_id, agent_name, session_id)
+        lock_token = await self.acquire_chat_lock(user_id, agent_name, session_id)
+        if lock_token is None:
+            raise CloudSessionLockedError(lock_scope)
+        try:
+            if self.skill_stage_budget is not None:
+                await self.skill_stage_budget.acquire(reserved_bytes)
+        except Exception:
+            await self.lock_manager.release(lock_scope, lock_token)
+            raise
+        return ReservedChatExecution(
+            lock_scope=lock_scope,
+            lock_token=lock_token,
+            reserved_bytes=reserved_bytes,
+            agent=agent,
         )
 
     async def run_chat(
@@ -303,24 +456,31 @@ class CloudRuntimeService:
         agent_name: str,
         session_id: str,
         content: str,
-        lock_token: str | None = None,
+        reservation: ReservedChatExecution | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> CloudChatResult:
         root = self.workspace_manager.ensure_user_workspace(user.user_id)
-        lock_scope = self._lock_scope(user.user_id, agent_name, session_id)
-        token = lock_token or await self.acquire_chat_lock(user.user_id, agent_name, session_id)
-        if token is None:
-            self.workspace_manager.cleanup_workspace(root)
-            raise CloudSessionLockedError(lock_scope)
+        if reservation is None:
+            reservation = await self.reserve_chat_execution(user.user_id, agent_name, session_id)
 
         runtime_dir: Path | None = None
         try:
             cfg = self.workspace_manager.load_workspace_config(root)
             if agent_name not in cfg.agents:
                 raise FileNotFoundError(agent_name)
-            agent = self.workspace_manager.load_agent_config(root, agent_name)
-            runtime_dir, builtin_dir, selected_skills_dir = self.workspace_manager.create_runtime_workspace(root, agent)
+            agent = reservation.agent
+            bundles = self.workspace_manager.prepare_skill_bundles(
+                root,
+                agent,
+                small_skill_max_bytes=self.settings.skill_cache.small_skill_max_bytes,
+            )
+            runtime_dir, builtin_dir, selected_skills_dir, _ = await self.workspace_manager.create_runtime_workspace(
+                root,
+                agent,
+                bundles=bundles,
+                bundle_store=self.skill_bundle_store,
+            )
             session_key = self._session_key(user.user_id, agent_name, session_id)
             await self._hydrate_online_session(runtime_dir, session_key)
             result = await self._executor(
@@ -345,7 +505,9 @@ class CloudRuntimeService:
             if runtime_dir is not None:
                 shutil.rmtree(runtime_dir, ignore_errors=True)
             self.workspace_manager.cleanup_workspace(root)
-            await self.lock_manager.release(lock_scope, token)
+            if self.skill_stage_budget is not None and reservation.reserved_bytes:
+                await self.skill_stage_budget.release(reservation.reserved_bytes)
+            await self.lock_manager.release(reservation.lock_scope, reservation.lock_token)
 
     async def _hydrate_online_session(self, runtime_dir: Path, session_key: str) -> None:
         payload = await self.session_store.load(session_key)
