@@ -2,8 +2,10 @@ import { useChatStore } from '../../stores/chatStore';
 import { Message } from './Message';
 
 export function MessageList() {
-  const { getCurrentSession } = useChatStore();
-  const session = getCurrentSession();
+  // Subscribe to sessions and currentSessionId to trigger re-renders
+  const sessions = useChatStore((state) => state.sessions);
+  const currentSessionId = useChatStore((state) => state.currentSessionId);
+  const session = sessions.find((s) => s.id === currentSessionId) || null;
 
   if (!session) {
     return (
