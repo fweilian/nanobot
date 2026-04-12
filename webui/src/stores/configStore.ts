@@ -13,7 +13,7 @@ interface ConfigState {
 export const useConfigStore = create<ConfigState>()(
   persist(
     (set) => ({
-      apiUrl: 'http://localhost:8890',
+      apiUrl: '',
       apiKey: '',
       theme: 'light',
       setApiUrl: (url) => set({ apiUrl: url }),

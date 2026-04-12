@@ -32,7 +32,7 @@ export function SettingsDrawer({ open, onClose }: SettingsDrawerProps) {
               type="text"
               value={apiUrl}
               onChange={(e) => setApiUrl(e.target.value)}
-              placeholder="http://localhost:8890"
+              placeholder="留空使用 Vite proxy (开发模式) 或输入完整 URL"
               className="w-full rounded-lg border border-gray-300 dark:border-gray-600 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:bg-gray-800"
             />
           </div>
