@@ -60,6 +60,12 @@ export function createChatStream(
             }
             try {
               const parsed = JSON.parse(data);
+              // Check for finish_reason to detect stream end (some backends don't send [DONE])
+              const finishReason = parsed.choices?.[0]?.finish_reason;
+              if (finishReason === 'stop') {
+                onDone();
+                return;
+              }
               const content = parsed.choices?.[0]?.delta?.content;
               if (content) onChunk(content);
             } catch {
