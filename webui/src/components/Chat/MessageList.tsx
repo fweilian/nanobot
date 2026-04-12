@@ -24,10 +24,12 @@ export function MessageList() {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto p-4 space-y-4">
+    <div className="flex-1 overflow-y-auto bg-gray-50/70 p-6 dark:bg-gray-950">
+      <div className="mx-auto flex max-w-5xl flex-col gap-4">
       {session.messages.map((msg) => (
         <Message key={msg.id} message={msg} />
       ))}
+      </div>
     </div>
   );
 }

@@ -55,6 +55,7 @@ class _LoopHook(AgentHook):
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         *,
         channel: str = "cli",
         chat_id: str = "direct",
@@ -65,6 +66,7 @@ class _LoopHook(AgentHook):
         self._on_progress = on_progress
         self._on_stream = on_stream
         self._on_stream_end = on_stream_end
+        self._on_tool_event = on_tool_event
         self._channel = channel
         self._chat_id = chat_id
         self._message_id = message_id
@@ -101,6 +103,23 @@ class _LoopHook(AgentHook):
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
+            if self._on_tool_event:
+                await self._on_tool_event(
+                    {
+                        "event": "tool_call_started",
+                        "tool_call_id": tc.id,
+                        "tool_name": tc.name,
+                        "args_text": args_str,
+                    }
+                )
+                await self._on_tool_event(
+                    {
+                        "event": "tool_call_updated",
+                        "tool_call_id": tc.id,
+                        "tool_name": tc.name,
+                        "args_text": args_str,
+                    }
+                )
         self._loop._set_tool_context(self._channel, self._chat_id, self._message_id)
 
     async def after_iteration(self, context: AgentHookContext) -> None:
@@ -111,6 +130,25 @@ class _LoopHook(AgentHook):
             u.get("completion_tokens", 0),
             u.get("cached_tokens", 0),
         )
+        if self._on_tool_event and context.tool_calls and context.tool_results:
+            for tc, result, event in zip(
+                context.tool_calls,
+                context.tool_results,
+                context.tool_events or [],
+            ):
+                status = event.get("status", "ok")
+                result_text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                if len(result_text) > 4000:
+                    result_text = result_text[:4000] + "..."
+                await self._on_tool_event(
+                    {
+                        "event": "tool_call_completed" if status == "ok" else "tool_call_failed",
+                        "tool_call_id": tc.id,
+                        "tool_name": tc.name,
+                        "args_text": json.dumps(tc.arguments, ensure_ascii=False),
+                        "result_text": result_text,
+                    }
+                )
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         return self._loop._strip_think(content)
@@ -336,6 +374,7 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         *,
         session: Session | None = None,
         channel: str = "cli",
@@ -357,6 +396,7 @@ class AgentLoop:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            on_tool_event=on_tool_event,
             channel=channel,
             chat_id=chat_id,
             message_id=message_id,
@@ -603,6 +643,7 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
@@ -696,6 +737,7 @@ class AgentLoop:
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            on_tool_event=on_tool_event,
             session=session,
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -902,6 +944,7 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
@@ -912,4 +955,5 @@ class AgentLoop:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            on_tool_event=on_tool_event,
         )

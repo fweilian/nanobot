@@ -37,6 +37,7 @@ class CloudChatResult:
 
     content: str
     model: str
+    message_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -457,8 +458,10 @@ class CloudRuntimeService:
         session_id: str,
         content: str,
         reservation: ReservedChatExecution | None = None,
+        message_id: str | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_event: Callable[[dict[str, object]], Awaitable[None]] | None = None,
     ) -> CloudChatResult:
         root = self.workspace_manager.ensure_user_workspace(user.user_id)
         if reservation is None:
@@ -492,8 +495,10 @@ class CloudRuntimeService:
                 agent=agent,
                 session_key=session_key,
                 content=content,
+                message_id=message_id,
                 on_stream=on_stream,
                 on_stream_end=on_stream_end,
+                on_tool_event=on_tool_event,
             )
             self.workspace_manager.persist_runtime_workspace(root, runtime_dir)
             await self._persist_online_session(runtime_dir, session_key)
@@ -541,8 +546,10 @@ class CloudRuntimeService:
         agent: CloudAgentConfig,
         session_key: str,
         content: str,
+        message_id: str | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_event: Callable[[dict[str, object]], Awaitable[None]] | None = None,
     ) -> CloudChatResult:
         config = self._build_effective_config(runtime_dir, agent)
         provider = _make_provider(config)
@@ -577,6 +584,7 @@ class CloudRuntimeService:
                     chat_id=user.user_id,
                     on_stream=on_stream,
                     on_stream_end=on_stream_end,
+                    on_tool_event=on_tool_event,
                 ),
                 timeout=self.settings.request_timeout,
             )
@@ -585,6 +593,7 @@ class CloudRuntimeService:
         return CloudChatResult(
             content=(response.content if response else "") or "",
             model=config.agents.defaults.model,
+            message_id=message_id,
         )
 
     def _build_effective_config(self, runtime_dir: Path, agent: CloudAgentConfig):

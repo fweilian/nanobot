@@ -70,13 +70,33 @@ def app(settings: CloudServiceSettings):
         agent,
         session_key,
         content,
+        message_id=None,
         on_stream=None,
         on_stream_end=None,
+        on_tool_event=None,
     ):
         path = session_file_path(runtime_dir, session_key)
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(existing + content, encoding="utf-8")
+        if on_tool_event:
+            await on_tool_event(
+                {
+                    "event": "tool_call_started",
+                    "tool_call_id": "tool-1",
+                    "tool_name": "read_file",
+                    "args_text": "{\"path\":\"README.md\"}",
+                }
+            )
+            await on_tool_event(
+                {
+                    "event": "tool_call_completed",
+                    "tool_call_id": "tool-1",
+                    "tool_name": "read_file",
+                    "args_text": "{\"path\":\"README.md\"}",
+                    "result_text": "README body",
+                }
+            )
         if on_stream:
             await on_stream("hello ")
             await on_stream("world")
@@ -122,6 +142,9 @@ def test_agents_bootstrap_and_chat(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["choices"][0]["message"]["content"] == "reply:hello"
+    assert body["message"]["role"] == "assistant"
+    assert any(block["type"] == "markdown" for block in body["message"]["blocks"])
+    assert any(block["type"] == "tool_call" for block in body["message"]["blocks"])
 
 
 def test_streaming_chat_returns_sse(client):
@@ -138,6 +161,71 @@ def test_streaming_chat_returns_sse(client):
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
     assert "data: [DONE]" in resp.text
+
+
+def test_streaming_chat_includes_tool_call_events(client):
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer token"},
+        json={
+          "agent": "default",
+          "session_id": "thread-1",
+          "stream": True,
+          "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert "tool_call_started" in resp.text
+    assert "tool_call_completed" in resp.text
+    assert "\"tool_name\": \"read_file\"" in resp.text
+
+
+def test_non_stream_response_preserves_interleaved_text_and_tool_order(client, monkeypatch):
+    runtime_service = client.app.state.runtime_service
+
+    async def fake_run_chat(*args, **kwargs):
+        on_stream = kwargs.get("on_stream")
+        on_tool_event = kwargs.get("on_tool_event")
+        if on_stream:
+            await on_stream("before tool")
+        if on_tool_event:
+            await on_tool_event(
+                {
+                    "event": "tool_call_started",
+                    "tool_call_id": "tool-1",
+                    "tool_name": "read_file",
+                    "args_text": "{\"path\":\"README.md\"}",
+                }
+            )
+            await on_tool_event(
+                {
+                    "event": "tool_call_completed",
+                    "tool_call_id": "tool-1",
+                    "tool_name": "read_file",
+                    "args_text": "{\"path\":\"README.md\"}",
+                    "result_text": "README body",
+                }
+            )
+        if on_stream:
+            await on_stream(" after tool")
+        return CloudChatResult(content="before tool after tool", model="openai/gpt-4.1")
+
+    monkeypatch.setattr(runtime_service, "run_chat", fake_run_chat)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer token"},
+        json={
+            "agent": "default",
+            "session_id": "thread-1",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert resp.status_code == 200
+    blocks = resp.json()["message"]["blocks"]
+    assert [block["type"] for block in blocks] == ["markdown", "tool_call", "markdown"]
 
 
 def test_streaming_unknown_agent_returns_404(client):

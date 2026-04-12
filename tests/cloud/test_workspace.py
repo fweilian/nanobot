@@ -233,8 +233,10 @@ async def test_multi_instance_flow_reuses_online_session(tmp_path: Path):
         agent,
         session_key,
         content,
+        message_id=None,
         on_stream=None,
         on_stream_end=None,
+        on_tool_event=None,
     ):
         path = session_file_path(runtime_dir, session_key)
         prior = path.read_text(encoding="utf-8") if path.exists() else ""
