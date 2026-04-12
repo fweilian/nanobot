@@ -78,6 +78,15 @@ class AuthSettings(BaseModel):
     user_id_claim: str = "sub"
 
 
+class RedisSettings(BaseModel):
+    """Redis settings for stateless multi-instance cloud mode."""
+
+    url: str = "redis://127.0.0.1:6379/0"
+    key_prefix: str = "nanobot-cloud"
+    session_ttl_s: int = 24 * 60 * 60
+    lock_ttl_s: int = 5 * 60
+
+
 class CloudServiceSettings(BaseSettings):
     """Service settings loaded from .env / environment."""
 
@@ -95,6 +104,7 @@ class CloudServiceSettings(BaseSettings):
     port: int = 8890
     workspace_prefix: str = "workspaces"
     auth: AuthSettings
+    redis: RedisSettings = Field(default_factory=RedisSettings)
     s3: S3Settings
 
     @property

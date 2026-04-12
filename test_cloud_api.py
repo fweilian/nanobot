@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8890)
     parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument("--redis-url", default="redis://127.0.0.1:6379/0")
     parser.add_argument("--s3-endpoint-url", default="http://127.0.0.1:9000")
     parser.add_argument("--s3-region-name", default="us-east-1")
     parser.add_argument("--s3-access-key-id", default="minioadmin")
@@ -73,6 +74,10 @@ def build_env(args: argparse.Namespace, cache_dir: Path, shared_secret: str) -> 
         "NANOBOT_CLOUD_PORT": str(args.port),
         "NANOBOT_CLOUD_REQUEST_TIMEOUT": str(args.timeout),
         "NANOBOT_CLOUD_WORKSPACE_PREFIX": args.workspace_prefix,
+        "NANOBOT_CLOUD_REDIS__URL": args.redis_url,
+        "NANOBOT_CLOUD_REDIS__KEY_PREFIX": f"nanobot-cloud-e2e:{args.s3_prefix}",
+        "NANOBOT_CLOUD_REDIS__SESSION_TTL_S": "3600",
+        "NANOBOT_CLOUD_REDIS__LOCK_TTL_S": "120",
         "NANOBOT_CLOUD_AUTH__ISSUER": "nanobot-cloud-e2e",
         "NANOBOT_CLOUD_AUTH__AUDIENCE": "nanobot-cloud",
         "NANOBOT_CLOUD_AUTH__USER_ID_CLAIM": "sub",

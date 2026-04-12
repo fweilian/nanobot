@@ -19,7 +19,9 @@ from nanobot.cloud.auth import (
     resolve_bearer_token,
 )
 from nanobot.cloud.config import CloudServiceSettings, ManagedProviderView
+from nanobot.cloud.lock import CloudSessionLockedError, RedisDistributedLockManager
 from nanobot.cloud.runtime import CloudRuntimeService, CloudWorkspaceManager
+from nanobot.cloud.session_store import RedisSessionStore
 from nanobot.cloud.storage import S3ObjectStore
 from nanobot.config.loader import load_config, resolve_config_env_vars
 
@@ -95,12 +97,15 @@ def _chunk(content: str | None, model: str, *, finish_reason: str | None = None,
 
 def build_runtime_service(settings: CloudServiceSettings) -> CloudRuntimeService:
     """Build the main cloud runtime service from settings."""
+    from redis.asyncio import Redis
+
     platform_config = resolve_config_env_vars(load_config(settings.nanobot_config_path))
     provider_name = platform_config.get_provider_name(platform_config.agents.defaults.model) or "managed"
     provider_view = ManagedProviderView(
         provider=provider_name,
         model=platform_config.agents.defaults.model,
     )
+    redis_client = Redis.from_url(settings.redis.url, encoding="utf-8", decode_responses=False)
     workspace_manager = CloudWorkspaceManager(
         store=S3ObjectStore(
             bucket=settings.s3.bucket,
@@ -118,6 +123,15 @@ def build_runtime_service(settings: CloudServiceSettings) -> CloudRuntimeService
         settings=settings,
         workspace_manager=workspace_manager,
         platform_config_path=settings.nanobot_config_path,
+        session_store=RedisSessionStore(
+            redis_client,
+            key_prefix=settings.redis.key_prefix,
+            ttl_s=settings.redis.session_ttl_s,
+        ),
+        lock_manager=RedisDistributedLockManager(
+            redis_client,
+            key_prefix=settings.redis.key_prefix,
+        ),
     )
 
 
@@ -152,6 +166,19 @@ def create_app(
         token: str = Depends(resolve_bearer_token),
     ) -> AuthenticatedUser:
         return request.app.state.token_verifier.verify(token)
+
+    def _session_locked_response() -> JSONResponse:
+        return JSONResponse(
+            {
+                "error": {
+                    "message": "Another write request is already in progress for this session.",
+                    "type": "conflict_error",
+                    "code": "session_locked",
+                    "retryable": True,
+                }
+            },
+            status_code=status.HTTP_409_CONFLICT,
+        )
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -204,6 +231,13 @@ def create_app(
                 detail=f"Only configured model '{service.platform_model}' is available",
             )
         content = _last_user_text(body.messages)
+        try:
+            await service.ensure_agent(user, body.agent)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        lock_token = await service.acquire_chat_lock(user.user_id, body.agent, body.session_id)
+        if lock_token is None:
+            return _session_locked_response()
 
         if not body.stream:
             try:
@@ -212,15 +246,13 @@ def create_app(
                     agent_name=body.agent,
                     session_id=body.session_id,
                     content=content,
+                    lock_token=lock_token,
                 )
+            except CloudSessionLockedError:
+                return _session_locked_response()
             except FileNotFoundError as exc:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
             return JSONResponse(_completion_response(result.content, result.model))
-
-        try:
-            await service.ensure_agent(user, body.agent)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
         async def event_stream():
             queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
@@ -238,6 +270,7 @@ def create_app(
                     agent_name=body.agent,
                     session_id=body.session_id,
                     content=content,
+                    lock_token=lock_token,
                     on_stream=_on_stream,
                     on_stream_end=_on_stream_end,
                 )
@@ -270,6 +303,15 @@ def create_app(
                     yield _chunk(None, model_name, finish_reason="stop")
                     yield "data: [DONE]\n\n"
                     break
+            except CloudSessionLockedError:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "session_locked",
+                        "message": "Another write request is already in progress for this session.",
+                        "retryable": True,
+                    },
+                )
             except FileNotFoundError as exc:
                 task.cancel()
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc

@@ -1,4 +1,4 @@
-"""Cloud runtime that bridges object storage, auth, and AgentLoop."""
+"""Cloud runtime that bridges object storage, Redis, and AgentLoop."""
 
 from __future__ import annotations
 
@@ -17,16 +17,11 @@ from nanobot.agent.skills import BUILTIN_SKILLS_DIR, SkillsLoader
 from nanobot.agent.subagent import SubagentManager
 from nanobot.bus.queue import MessageBus
 from nanobot.cloud.auth import AuthenticatedUser
-from nanobot.cloud.config import (
-    CloudAgentConfig,
-    ManagedProviderView,
-    UserWorkspaceConfig,
-    utc_now_iso,
-)
-from nanobot.cloud.storage import ObjectStore, download_prefix, upload_tree
-from nanobot.config.loader import load_config, resolve_config_env_vars
+from nanobot.cloud.config import CloudAgentConfig, utc_now_iso
+from nanobot.cloud.lock import CloudSessionLockedError
+from nanobot.cloud.session_store import OnlineSessionStore, session_file_path
+from nanobot.cloud.workspace_sync import RequestWorkspaceManager
 from nanobot.nanobot import _make_provider
-from nanobot.utils.helpers import sync_workspace_templates
 
 
 @dataclass(slots=True)
@@ -70,10 +65,7 @@ class CloudSubagentManager(SubagentManager):
         from nanobot.utils.prompt_templates import render_template
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
-        loader = SkillsLoader(
-            self.workspace,
-            builtin_skills_dir=self._builtin_skills_dir,
-        )
+        loader = SkillsLoader(self.workspace, builtin_skills_dir=self._builtin_skills_dir)
         loader.workspace_skills = self._selected_skills_dir
         skills_summary = loader.build_skills_summary()
         return render_template(
@@ -95,7 +87,6 @@ class CloudAgentLoop(AgentLoop):
         **kwargs,
     ) -> None:
         self._cloud_builtin_skills_dir = builtin_skills_dir
-        self._cloud_selected_skills_dir = selected_skills_dir
         super().__init__(*args, **kwargs)
         self.context = CloudContextBuilder(
             self.workspace,
@@ -133,9 +124,7 @@ class CloudAgentLoop(AgentLoop):
         from nanobot.agent.tools.spawn import SpawnTool
         from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 
-        allowed_dir = (
-            self.workspace if (self.restrict_to_workspace or self.exec_config.sandbox) else None
-        )
+        allowed_dir = self.workspace if (self.restrict_to_workspace or self.exec_config.sandbox) else None
         extra_read = [self._cloud_builtin_skills_dir] if allowed_dir else None
         self.tools.register(
             ReadFileTool(
@@ -161,9 +150,7 @@ class CloudAgentLoop(AgentLoop):
                 )
             )
         if self.web_config.enable:
-            self.tools.register(
-                WebSearchTool(config=self.web_config.search, proxy=self.web_config.proxy)
-            )
+            self.tools.register(WebSearchTool(config=self.web_config.search, proxy=self.web_config.proxy))
             self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
@@ -173,83 +160,11 @@ class CloudAgentLoop(AgentLoop):
             )
 
 
-class CloudWorkspaceManager:
-    """Manage per-user workspaces backed by object storage."""
-
-    CONFIG_NAME = "config.json"
-
-    def __init__(
-        self,
-        *,
-        store: ObjectStore,
-        cache_root: Path,
-        workspace_prefix: str,
-        platform_provider: ManagedProviderView,
-    ) -> None:
-        self.store = store
-        self.cache_root = cache_root
-        self.workspace_prefix = workspace_prefix.strip("/")
-        self.platform_provider = platform_provider
-
-    def user_prefix(self, user_id: str) -> str:
-        return f"{self.workspace_prefix}/{user_id}"
-
-    def user_cache_dir(self, user_id: str) -> Path:
-        return self.cache_root / "users" / user_id
-
-    def runtime_root(self, user_id: str) -> Path:
-        return self.cache_root / "runtimes" / user_id
-
-    def ensure_user_workspace(self, user_id: str) -> Path:
-        prefix = self.user_prefix(user_id)
-        root = self.user_cache_dir(user_id)
-        if self.store.list_keys(prefix):
-            download_prefix(self.store, prefix, root)
-        else:
-            if root.exists():
-                shutil.rmtree(root)
-            root.mkdir(parents=True, exist_ok=True)
-            sync_workspace_templates(root, silent=True)
-            cfg = UserWorkspaceConfig(
-                user_id=user_id,
-                providers={"managed": self.platform_provider},
-                agents={"default": "agents/default/config.json"},
-            )
-            self.save_workspace_config(root, cfg)
-            self.save_agent_config(root, CloudAgentConfig(name="default"))
-            upload_tree(self.store, root, prefix)
-        return root
-
-    def load_workspace_config(self, root: Path) -> UserWorkspaceConfig:
-        return UserWorkspaceConfig.model_validate_json((root / self.CONFIG_NAME).read_text(encoding="utf-8"))
-
-    def save_workspace_config(self, root: Path, config: UserWorkspaceConfig) -> None:
-        (root / self.CONFIG_NAME).write_text(
-            json.dumps(config.model_dump(mode="json"), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-
-    def agent_config_path(self, root: Path, agent_name: str) -> Path:
-        return root / "agents" / agent_name / "config.json"
-
-    def load_agent_config(self, root: Path, agent_name: str) -> CloudAgentConfig:
-        path = self.agent_config_path(root, agent_name)
-        if not path.exists():
-            raise FileNotFoundError(agent_name)
-        return CloudAgentConfig.model_validate_json(path.read_text(encoding="utf-8"))
-
-    def save_agent_config(self, root: Path, config: CloudAgentConfig) -> None:
-        path = self.agent_config_path(root, config.name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(config.model_dump(mode="json"), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+class CloudWorkspaceManager(RequestWorkspaceManager):
+    """Request-scoped cloud workspace manager with runtime materialization."""
 
     def create_runtime_workspace(self, root: Path, agent: CloudAgentConfig) -> tuple[Path, Path, Path]:
-        runtime_parent = self.runtime_root(root.name)
-        runtime_parent.mkdir(parents=True, exist_ok=True)
-        runtime_dir = Path(tempfile.mkdtemp(prefix=f"{agent.name}-", dir=runtime_parent))
+        runtime_dir = Path(tempfile.mkdtemp(prefix=f"{agent.name}-", dir=root.parent))
         shutil.copytree(root, runtime_dir, dirs_exist_ok=True)
         selected_builtin_dir = runtime_dir / ".cloud_builtin_skills"
         selected_builtin_dir.mkdir(parents=True, exist_ok=True)
@@ -332,10 +247,6 @@ class CloudWorkspaceManager:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copytree(staged, target)
 
-    def upload_user_workspace(self, user_id: str, root: Path) -> None:
-        self.store.delete_prefix(self.user_prefix(user_id))
-        upload_tree(self.store, root, self.user_prefix(user_id))
-
 
 class CloudRuntimeService:
     """Main application service for the cloud runtime."""
@@ -346,36 +257,44 @@ class CloudRuntimeService:
         settings,
         workspace_manager: CloudWorkspaceManager,
         platform_config_path: Path,
+        session_store: OnlineSessionStore,
+        lock_manager,
         executor: Callable[..., Awaitable[CloudChatResult]] | None = None,
     ) -> None:
+        from nanobot.config.loader import load_config, resolve_config_env_vars
+
         self.settings = settings
         self.workspace_manager = workspace_manager
         self.platform_config_path = platform_config_path
         self.platform_config = resolve_config_env_vars(load_config(platform_config_path))
         self.platform_model = self.platform_config.agents.defaults.model
+        self.session_store = session_store
+        self.lock_manager = lock_manager
         self._executor = executor or self._run_with_agent_loop
-        self._user_locks: dict[str, asyncio.Lock] = {}
-
-    def user_lock(self, user_id: str) -> asyncio.Lock:
-        return self._user_locks.setdefault(user_id, asyncio.Lock())
 
     async def list_agents(self, user: AuthenticatedUser) -> list[CloudAgentConfig]:
-        async with self.user_lock(user.user_id):
-            root = self.workspace_manager.ensure_user_workspace(user.user_id)
+        root = self.workspace_manager.ensure_user_workspace(user.user_id)
+        try:
             cfg = self.workspace_manager.load_workspace_config(root)
-            agents: list[CloudAgentConfig] = []
-            for name in sorted(cfg.agents):
-                agents.append(self.workspace_manager.load_agent_config(root, name))
-            self.workspace_manager.upload_user_workspace(user.user_id, root)
-            return agents
+            return [self.workspace_manager.load_agent_config(root, name) for name in sorted(cfg.agents)]
+        finally:
+            self.workspace_manager.cleanup_workspace(root)
 
     async def ensure_agent(self, user: AuthenticatedUser, agent_name: str) -> CloudAgentConfig:
-        async with self.user_lock(user.user_id):
-            root = self.workspace_manager.ensure_user_workspace(user.user_id)
+        root = self.workspace_manager.ensure_user_workspace(user.user_id)
+        try:
             cfg = self.workspace_manager.load_workspace_config(root)
             if agent_name not in cfg.agents:
                 raise FileNotFoundError(agent_name)
             return self.workspace_manager.load_agent_config(root, agent_name)
+        finally:
+            self.workspace_manager.cleanup_workspace(root)
+
+    async def acquire_chat_lock(self, user_id: str, agent_name: str, session_id: str) -> str | None:
+        return await self.lock_manager.acquire(
+            self._lock_scope(user_id, agent_name, session_id),
+            self.settings.redis.lock_ttl_s,
+        )
 
     async def run_chat(
         self,
@@ -384,36 +303,70 @@ class CloudRuntimeService:
         agent_name: str,
         session_id: str,
         content: str,
+        lock_token: str | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> CloudChatResult:
-        async with self.user_lock(user.user_id):
-            root = self.workspace_manager.ensure_user_workspace(user.user_id)
+        root = self.workspace_manager.ensure_user_workspace(user.user_id)
+        lock_scope = self._lock_scope(user.user_id, agent_name, session_id)
+        token = lock_token or await self.acquire_chat_lock(user.user_id, agent_name, session_id)
+        if token is None:
+            self.workspace_manager.cleanup_workspace(root)
+            raise CloudSessionLockedError(lock_scope)
+
+        runtime_dir: Path | None = None
+        try:
             cfg = self.workspace_manager.load_workspace_config(root)
             if agent_name not in cfg.agents:
                 raise FileNotFoundError(agent_name)
             agent = self.workspace_manager.load_agent_config(root, agent_name)
             runtime_dir, builtin_dir, selected_skills_dir = self.workspace_manager.create_runtime_workspace(root, agent)
-            try:
-                result = await self._executor(
-                    root,
-                    runtime_dir,
-                    builtin_dir,
-                    selected_skills_dir,
-                    user=user,
-                    agent=agent,
-                    session_key=f"cloud:{user.user_id}:{agent_name}:{session_id}",
-                    content=content,
-                    on_stream=on_stream,
-                    on_stream_end=on_stream_end,
-                )
-                self.workspace_manager.persist_runtime_workspace(root, runtime_dir)
-                cfg.updated_at = utc_now_iso()
-                self.workspace_manager.save_workspace_config(root, cfg)
-                self.workspace_manager.upload_user_workspace(user.user_id, root)
-                return result
-            finally:
+            session_key = self._session_key(user.user_id, agent_name, session_id)
+            await self._hydrate_online_session(runtime_dir, session_key)
+            result = await self._executor(
+                root,
+                runtime_dir,
+                builtin_dir,
+                selected_skills_dir,
+                user=user,
+                agent=agent,
+                session_key=session_key,
+                content=content,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+            )
+            self.workspace_manager.persist_runtime_workspace(root, runtime_dir)
+            await self._persist_online_session(runtime_dir, session_key)
+            cfg.updated_at = utc_now_iso()
+            self.workspace_manager.save_workspace_config(root, cfg)
+            self.workspace_manager.upload_user_workspace(user.user_id, root)
+            return result
+        finally:
+            if runtime_dir is not None:
                 shutil.rmtree(runtime_dir, ignore_errors=True)
+            self.workspace_manager.cleanup_workspace(root)
+            await self.lock_manager.release(lock_scope, token)
+
+    async def _hydrate_online_session(self, runtime_dir: Path, session_key: str) -> None:
+        payload = await self.session_store.load(session_key)
+        if payload is None:
+            return
+        path = session_file_path(runtime_dir, session_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+    async def _persist_online_session(self, runtime_dir: Path, session_key: str) -> None:
+        path = session_file_path(runtime_dir, session_key)
+        if not path.exists():
+            await self.session_store.delete(session_key)
+            return
+        await self.session_store.save(session_key, path.read_bytes())
+
+    def _session_key(self, user_id: str, agent_name: str, session_id: str) -> str:
+        return f"cloud:{user_id}:{agent_name}:{session_id}"
+
+    def _lock_scope(self, user_id: str, agent_name: str, session_id: str) -> str:
+        return f"chat:{user_id}:{agent_name}:{session_id}"
 
     async def _run_with_agent_loop(
         self,

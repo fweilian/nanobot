@@ -28,6 +28,10 @@ See [`.env.example`](../.env.example) for the full list.
 - `NANOBOT_CLOUD_PORT`
 - `NANOBOT_CLOUD_REQUEST_TIMEOUT`
 - `NANOBOT_CLOUD_WORKSPACE_PREFIX`
+- `NANOBOT_CLOUD_REDIS__URL`
+- `NANOBOT_CLOUD_REDIS__KEY_PREFIX`
+- `NANOBOT_CLOUD_REDIS__SESSION_TTL_S`
+- `NANOBOT_CLOUD_REDIS__LOCK_TTL_S`
 - `NANOBOT_CLOUD_AUTH__ISSUER`
 - `NANOBOT_CLOUD_AUTH__AUDIENCE`
 - `NANOBOT_CLOUD_AUTH__USER_ID_CLAIM`
@@ -44,6 +48,12 @@ Cloud mode has two configuration layers:
 
 1. Platform-level config
 2. User/agent-level cloud config
+
+Runtime state in the current stateless multi-instance design is split across:
+
+- `Redis` for online session state and distributed locks
+- `S3` for durable workspace files and long-term artifacts
+- local disk only for request-scoped temporary execution directories
 
 ### 1. Platform-level config
 
@@ -228,7 +238,9 @@ This means:
 - different agents under the same user are isolated
 - different `session_id` values under the same user+agent are isolated
 
-Session files are persisted through the S3-backed workspace, so they survive service restarts.
+Online session truth lives in `Redis`.
+Durable workspace/session artifacts can still be archived through the S3-backed workspace.
+Instances are expected to be stateless across requests.
 
 ## First Login Bootstrap
 
@@ -253,3 +265,377 @@ For local MinIO development, set:
 - `NANOBOT_CLOUD_S3__ACCESS_KEY_ID`
 - `NANOBOT_CLOUD_S3__SECRET_ACCESS_KEY`
 - `NANOBOT_CLOUD_S3__BUCKET`
+
+For stateless multi-instance development, also set:
+
+- `NANOBOT_CLOUD_REDIS__URL`
+
+## Real E2E Validation
+
+This section records a real local validation flow that was executed in WSL2 against:
+
+- Redis on `127.0.0.1:6379`
+- MinIO on `http://127.0.0.1:9000`
+- a real provider from local `platform-config.json`
+
+It is intended as a repeatable smoke test, not just a conceptual example.
+
+### Local Prerequisites
+
+- WSL2 shell
+- repo at `/home/fweil/gitprojects/nanobot`
+- `platform-config.json` contains a real, working provider key
+- Redis running locally
+- MinIO running locally
+
+### Example local services
+
+The validation run used:
+
+- Redis:
+  - host: `127.0.0.1`
+  - port: `6379`
+  - password: `123456`
+- MinIO:
+  - endpoint: `http://127.0.0.1:9000`
+  - access key: `admin`
+  - secret key: `password123`
+  - bucket: `nanobot-cloud`
+
+Adjust these if your local setup differs.
+
+### 1. Verify Redis and MinIO connectivity
+
+```bash
+cd /home/fweil/gitprojects/nanobot
+
+uv run --extra cloud python - <<'PY'
+import asyncio
+from redis.asyncio import Redis
+import boto3
+
+async def main():
+    r = Redis.from_url('redis://:123456@127.0.0.1:6379/0', encoding='utf-8', decode_responses=True)
+    try:
+        await r.ping()
+        print('redis=ok')
+    finally:
+        await r.aclose()
+
+    s3 = boto3.client(
+        's3',
+        endpoint_url='http://127.0.0.1:9000',
+        region_name='us-east-1',
+        aws_access_key_id='admin',
+        aws_secret_access_key='password123',
+    )
+    print('minio_list_buckets_ok=', isinstance(s3.list_buckets().get('Buckets', []), list))
+
+asyncio.run(main())
+PY
+```
+
+Expected result:
+
+- `redis=ok`
+- `minio_list_buckets_ok= True`
+
+### 2. Make sure the MinIO bucket exists
+
+```bash
+uv run --extra cloud python - <<'PY'
+import boto3
+
+s3 = boto3.client(
+    's3',
+    endpoint_url='http://127.0.0.1:9000',
+    region_name='us-east-1',
+    aws_access_key_id='admin',
+    aws_secret_access_key='password123',
+)
+
+try:
+    s3.head_bucket(Bucket='nanobot-cloud')
+    print('bucket_exists')
+except Exception:
+    s3.create_bucket(Bucket='nanobot-cloud')
+    print('bucket_created')
+PY
+```
+
+### 3. Start the cloud service in WSL2
+
+Use a dedicated Redis key prefix and S3 prefix for one validation run:
+
+```bash
+export NANOBOT_CLOUD_NANOBOT_CONFIG_PATH=/home/fweil/gitprojects/nanobot/platform-config.json
+export NANOBOT_CLOUD_LOCAL_CACHE_DIR=/tmp/nanobot-cloud-manual
+export NANOBOT_CLOUD_HOST=127.0.0.1
+export NANOBOT_CLOUD_PORT=8890
+export NANOBOT_CLOUD_REQUEST_TIMEOUT=60
+export NANOBOT_CLOUD_WORKSPACE_PREFIX=workspaces
+
+export NANOBOT_CLOUD_REDIS__URL='redis://:123456@127.0.0.1:6379/0'
+export NANOBOT_CLOUD_REDIS__KEY_PREFIX='nanobot-cloud-e2e:e2e-manual-1775971831-588c77'
+export NANOBOT_CLOUD_REDIS__SESSION_TTL_S=3600
+export NANOBOT_CLOUD_REDIS__LOCK_TTL_S=120
+
+export NANOBOT_CLOUD_AUTH__ISSUER='nanobot-cloud-e2e'
+export NANOBOT_CLOUD_AUTH__AUDIENCE='nanobot-cloud'
+export NANOBOT_CLOUD_AUTH__USER_ID_CLAIM='sub'
+export NANOBOT_CLOUD_AUTH__ALGORITHMS='["HS256"]'
+export NANOBOT_CLOUD_AUTH__SHARED_SECRET='manual-e2e-long-secret-1234567890'
+
+export NANOBOT_CLOUD_S3__BUCKET='nanobot-cloud'
+export NANOBOT_CLOUD_S3__PREFIX='e2e-manual-1775971831-588c77'
+export NANOBOT_CLOUD_S3__ENDPOINT_URL='http://127.0.0.1:9000'
+export NANOBOT_CLOUD_S3__REGION_NAME='us-east-1'
+export NANOBOT_CLOUD_S3__ACCESS_KEY_ID='admin'
+export NANOBOT_CLOUD_S3__SECRET_ACCESS_KEY='password123'
+
+uv run --extra cloud nanobot-cloud
+```
+
+Expected startup log:
+
+- `Application startup complete.`
+- `Uvicorn running on http://127.0.0.1:8890`
+
+### 4. Verify health and model listing
+
+In another WSL2 terminal:
+
+```bash
+cd /home/fweil/gitprojects/nanobot
+
+uv run --extra cloud python - <<'PY'
+import httpx
+
+print('health=', httpx.get('http://127.0.0.1:8890/health', timeout=5).text)
+print('models=', httpx.get('http://127.0.0.1:8890/v1/models', timeout=5).text)
+PY
+```
+
+Expected result:
+
+- `health= {"status":"ok"}`
+- `/v1/models` returns the platform-managed model from `platform-config.json`
+
+### 5. Generate local HS256 bearer tokens
+
+```bash
+uv run --extra cloud python - <<'PY'
+import jwt, time
+
+secret = 'manual-e2e-long-secret-1234567890'
+for user in ('alice', 'bob'):
+    payload = {
+        'sub': user,
+        'iss': 'nanobot-cloud-e2e',
+        'aud': 'nanobot-cloud',
+        'iat': int(time.time()),
+        'exp': int(time.time()) + 3600,
+    }
+    print(user, jwt.encode(payload, secret, algorithm='HS256'))
+PY
+```
+
+### 6. Verify first-login bootstrap for two users
+
+Using the generated tokens:
+
+```bash
+uv run --extra cloud python - <<'PY'
+import httpx
+
+ALICE='PASTE_ALICE_TOKEN_HERE'
+BOB='PASTE_BOB_TOKEN_HERE'
+
+client = httpx.Client(timeout=10)
+print('alice_agents=', client.get('http://127.0.0.1:8890/v1/agents', headers={'Authorization': f'Bearer {ALICE}'}).text)
+print('bob_agents=', client.get('http://127.0.0.1:8890/v1/agents', headers={'Authorization': f'Bearer {BOB}'}).text)
+PY
+```
+
+Expected result:
+
+- both users return `default` agent
+- this confirms auth, first login bootstrap, and per-user workspace creation
+
+### 7. Real chat validation for Alice
+
+```bash
+uv run --extra cloud python - <<'PY'
+import httpx, time
+
+ALICE='PASTE_ALICE_TOKEN_HERE'
+payload = {
+    'agent': 'default',
+    'session_id': 'manual-thread-1',
+    'messages': [{'role': 'user', 'content': 'Reply with exactly: ALICE_OK'}],
+}
+
+start = time.time()
+r = httpx.post(
+    'http://127.0.0.1:8890/v1/chat/completions',
+    headers={'Authorization': f'Bearer {ALICE}'},
+    json=payload,
+    timeout=90,
+)
+print('elapsed=', round(time.time() - start, 2))
+print('status=', r.status_code)
+print(r.text[:4000])
+PY
+```
+
+Observed result from the real run:
+
+- HTTP `200`
+- model: `MiniMax-M2.7`
+- assistant content: `ALICE_OK`
+
+### 8. Real chat validation for Bob with the same raw session id
+
+```bash
+uv run --extra cloud python - <<'PY'
+import httpx, time
+
+BOB='PASTE_BOB_TOKEN_HERE'
+payload = {
+    'agent': 'default',
+    'session_id': 'manual-thread-1',
+    'messages': [{'role': 'user', 'content': 'Reply with exactly: BOB_OK'}],
+}
+
+start = time.time()
+r = httpx.post(
+    'http://127.0.0.1:8890/v1/chat/completions',
+    headers={'Authorization': f'Bearer {BOB}'},
+    json=payload,
+    timeout=90,
+)
+print('elapsed=', round(time.time() - start, 2))
+print('status=', r.status_code)
+print(r.text[:4000])
+PY
+```
+
+Observed result from the real run:
+
+- HTTP `200`
+- assistant content: `BOB_OK`
+
+This validates that the same raw `session_id` is still isolated by:
+
+- `user_id`
+- `agent_name`
+- `session_id`
+
+### 9. Check durable state in MinIO
+
+```bash
+uv run --extra cloud python - <<'PY'
+import boto3
+
+s3 = boto3.client(
+    's3',
+    endpoint_url='http://127.0.0.1:9000',
+    region_name='us-east-1',
+    aws_access_key_id='admin',
+    aws_secret_access_key='password123',
+)
+
+for user in ('alice', 'bob'):
+    resp = s3.list_objects_v2(
+        Bucket='nanobot-cloud',
+        Prefix=f'e2e-manual-1775971831-588c77/workspaces/{user}/sessions/',
+    )
+    print(user, [x['Key'] for x in resp.get('Contents', [])])
+PY
+```
+
+Observed result from the real run:
+
+- Alice session file existed:
+  - `.../workspaces/alice/sessions/cloud_alice_default_manual-thread-1.jsonl`
+- Bob session file existed:
+  - `.../workspaces/bob/sessions/cloud_bob_default_manual-thread-1.jsonl`
+
+### 10. Check online session state in Redis
+
+```bash
+uv run --extra cloud python - <<'PY'
+import asyncio
+from redis.asyncio import Redis
+
+async def main():
+    r = Redis.from_url('redis://:123456@127.0.0.1:6379/0', encoding='utf-8', decode_responses=False)
+    try:
+        keys = await r.keys('nanobot-cloud-e2e:e2e-manual-1775971831-588c77*')
+        print([k.decode() if isinstance(k, bytes) else k for k in keys])
+    finally:
+        await r.aclose()
+
+asyncio.run(main())
+PY
+```
+
+Observed result from the real run included:
+
+- lock key for Alice chat scope
+- online session key for Alice
+- online session key for Bob
+
+### 11. Restart the cloud service and re-test Alice
+
+Stop the service, restart it with the same environment, then run:
+
+```bash
+uv run --extra cloud python - <<'PY'
+import httpx, time
+
+ALICE='PASTE_ALICE_TOKEN_HERE'
+payload = {
+    'agent': 'default',
+    'session_id': 'manual-thread-1',
+    'messages': [{'role': 'user', 'content': 'Reply with exactly: ALICE_RESTART_OK'}],
+}
+
+start = time.time()
+r = httpx.post(
+    'http://127.0.0.1:8890/v1/chat/completions',
+    headers={'Authorization': f'Bearer {ALICE}'},
+    json=payload,
+    timeout=90,
+)
+print('elapsed=', round(time.time() - start, 2))
+print('status=', r.status_code)
+print(r.text[:4000])
+PY
+```
+
+Observed result from the real run:
+
+- HTTP `200`
+- assistant content: `ALICE_RESTART_OK`
+
+This validates that:
+
+- the service can restart cleanly
+- the same `user + agent + session_id` can continue after restart
+- Redis and S3 together preserve the needed state
+
+## Real Validation Summary
+
+This real WSL2 validation confirmed:
+
+- Redis connectivity
+- MinIO connectivity
+- cloud service startup
+- health and model listing
+- first-login bootstrap for multiple users
+- real provider-backed chat completions
+- per-user isolation with the same raw `session_id`
+- Redis online session keys
+- MinIO durable session files
+- successful post-restart chat continuation
