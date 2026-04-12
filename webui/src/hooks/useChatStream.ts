@@ -15,9 +15,8 @@ export function useChatStream() {
       // Add user message
       addMessage(session.id, { role: 'user', content });
 
-      // Create placeholder for assistant
-      const assistantMsgId = crypto.randomUUID();
-      addMessage(session.id, { role: 'assistant', content: '' });
+      // Create placeholder for assistant and get the actual message id
+      const assistantMsgId = addMessage(session.id, { role: 'assistant', content: '' });
 
       setStreaming(true);
 

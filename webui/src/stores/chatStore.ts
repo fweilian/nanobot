@@ -13,7 +13,7 @@ interface ChatState {
   createSession: (agentId: string) => string;
   deleteSession: (id: string) => void;
   selectSession: (id: string) => void;
-  addMessage: (sessionId: string, message: Omit<Message, 'id' | 'createdAt'>) => void;
+  addMessage: (sessionId: string, message: Omit<Message, 'id' | 'createdAt'>) => string; // returns the generated message id
   updateStreamingMessage: (sessionId: string, messageId: string, content: string) => void;
   setStreaming: (streaming: boolean) => void;
   getCurrentSession: () => Session | null;
@@ -52,7 +52,8 @@ export const useChatStore = create<ChatState>()(
           return { sessions, currentSessionId };
         }),
       selectSession: (id) => set({ currentSessionId: id }),
-      addMessage: (sessionId, message) =>
+      addMessage: (sessionId, message) => {
+        const newId = generateId();
         set((state) => ({
           sessions: state.sessions.map((s) =>
             s.id === sessionId
@@ -62,7 +63,7 @@ export const useChatStore = create<ChatState>()(
                     ...s.messages,
                     {
                       ...message,
-                      id: generateId(),
+                      id: newId,
                       createdAt: Date.now(),
                     },
                   ],
@@ -74,7 +75,9 @@ export const useChatStore = create<ChatState>()(
                 }
               : s
           ),
-        })),
+        }));
+        return newId;
+      },
       updateStreamingMessage: (sessionId, messageId, content) =>
         set((state) => ({
           sessions: state.sessions.map((s) =>
