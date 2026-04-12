@@ -13,13 +13,17 @@ export async function apiRequest<T>(
 ): Promise<T> {
   const { apiUrl, apiKey } = useConfigStore.getState();
 
-  const headers: HeadersInit = {
+  const headers = new Headers({
     'Content-Type': 'application/json',
-    ...options.headers,
-  };
+  });
+
+  if (options.headers) {
+    const extraHeaders = new Headers(options.headers as HeadersInit);
+    extraHeaders.forEach((value, key) => headers.set(key, value));
+  }
 
   if (apiKey) {
-    headers['Authorization'] = `Bearer ${apiKey}`;
+    headers.set('Authorization', `Bearer ${apiKey}`);
   }
 
   const response = await fetch(`${apiUrl}${endpoint}`, {
