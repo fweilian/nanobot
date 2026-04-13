@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 from nanobot.cloud.config import CloudAgentConfig, ManagedProviderView, UserWorkspaceConfig
-from nanobot.cloud.storage import download_prefix, upload_tree
+from nanobot.cloud.storage import download_prefix
 from nanobot.utils.helpers import sync_workspace_templates
 
 
@@ -47,17 +47,10 @@ class RequestWorkspaceManager:
     def ensure_user_workspace(self, user_id: str) -> Path:
         root = Path(tempfile.mkdtemp(prefix=f"{user_id}-", dir=self._requests_root()))
         prefix = self.user_prefix(user_id)
-        if self.store.list_keys(prefix):
+        if self.workspace_exists_remote(user_id) or self.store.list_keys(prefix):
             download_prefix(self.store, prefix, root)
         else:
-            sync_workspace_templates(root, silent=True)
-            cfg = UserWorkspaceConfig(
-                user_id=user_id,
-                providers={"managed": self.platform_provider},
-                agents={"default": "agents/default/config.json"},
-            )
-            self.save_workspace_config(root, cfg)
-            self.save_agent_config(root, CloudAgentConfig(name="default"))
+            self.initialize_user_workspace(root, user_id)
             self.upload_user_workspace(user_id, root)
         return root
 
@@ -72,6 +65,9 @@ class RequestWorkspaceManager:
         if not self.store.exists(key):
             return None
         return UserWorkspaceConfig.model_validate_json(self.store.get_bytes(key).decode("utf-8"))
+
+    def workspace_exists_remote(self, user_id: str) -> bool:
+        return self.store.exists(self.workspace_config_key(user_id))
 
     def save_workspace_config(self, root: Path, config: UserWorkspaceConfig) -> None:
         (root / self.CONFIG_NAME).write_text(
@@ -99,9 +95,65 @@ class RequestWorkspaceManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(config.model_dump_json(indent=2), encoding="utf-8")
 
+    def initialize_user_workspace(self, root: Path, user_id: str) -> None:
+        sync_workspace_templates(root, silent=True)
+        cfg = UserWorkspaceConfig(
+            user_id=user_id,
+            providers={"managed": self.platform_provider},
+            agents={"default": "agents/default/config.json"},
+        )
+        self.save_workspace_config(root, cfg)
+        self.save_agent_config(root, CloudAgentConfig(name="default"))
+
+    def bootstrap_user_workspace(self, user_id: str) -> bool:
+        if self.workspace_exists_remote(user_id):
+            return False
+        root = Path(tempfile.mkdtemp(prefix=f"{user_id}-bootstrap-", dir=self._requests_root()))
+        try:
+            self.initialize_user_workspace(root, user_id)
+            if self.workspace_exists_remote(user_id):
+                return False
+            self.upload_user_workspace(user_id, root)
+            return True
+        finally:
+            self.cleanup_workspace(root)
+
+    def list_agents_remote(self, user_id: str) -> list[CloudAgentConfig] | None:
+        cfg = self.load_workspace_config_remote(user_id)
+        if cfg is None:
+            return None
+        agents: list[CloudAgentConfig] = []
+        for name in sorted(cfg.agents):
+            agent = self.load_agent_config_remote(user_id, name)
+            if agent is None:
+                raise FileNotFoundError(name)
+            agents.append(agent)
+        return agents
+
+    def _workspace_file_keys(self, user_id: str, root: Path) -> dict[str, Path]:
+        base = self.user_prefix(user_id).rstrip("/")
+        mapping: dict[str, Path] = {}
+        for path in root.rglob("*"):
+            if ".git" in path.parts or not path.is_file():
+                continue
+            rel = path.relative_to(root).as_posix()
+            key = f"{base}/{rel}" if base else rel
+            mapping[key] = path
+        return mapping
+
     def upload_user_workspace(self, user_id: str, root: Path) -> None:
-        self.store.delete_prefix(self.user_prefix(user_id))
-        upload_tree(self.store, root, self.user_prefix(user_id))
+        desired = self._workspace_file_keys(user_id, root)
+        config_key = self.workspace_config_key(user_id)
+        existing = set(self.store.list_keys(self.user_prefix(user_id)))
+        for key in sorted(desired):
+            if key == config_key:
+                continue
+            self.store.put_bytes(key, desired[key].read_bytes())
+        if config_key in desired:
+            self.store.put_bytes(config_key, desired[config_key].read_bytes())
+        stale = sorted(existing - set(desired))
+        if stale:
+            self.store.delete_keys(stale)
 
     def estimate_workspace_bytes(self, user_id: str) -> int:
         total = sum(size for _, size in self.store.list_entries(self.user_prefix(user_id)))

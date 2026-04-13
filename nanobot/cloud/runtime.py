@@ -6,10 +6,13 @@ import asyncio
 import json
 import shutil
 import tempfile
+import uuid
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
+
+from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.loop import AgentLoop
@@ -19,6 +22,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.cloud.auth import AuthenticatedUser
 from nanobot.cloud.config import CloudAgentConfig, utc_now_iso
 from nanobot.cloud.lock import CloudSessionLockedError
+from nanobot.cloud.session_catalog import CloudSessionCatalog
 from nanobot.cloud.session_store import OnlineSessionStore, session_file_path
 from nanobot.cloud.skills_cache import (
     PreparedSkillBundle,
@@ -353,28 +357,23 @@ class CloudRuntimeService:
         self.platform_config = resolve_config_env_vars(load_config(platform_config_path))
         self.platform_model = self.platform_config.agents.defaults.model
         self.session_store = session_store
+        self.session_catalog = CloudSessionCatalog(workspace_manager, session_store)
         self.lock_manager = lock_manager
         self.skill_bundle_store = skill_bundle_store
         self.skill_stage_budget = skill_stage_budget
         self._executor = executor or self._run_with_agent_loop
+        self._bootstrap_tasks: dict[str, asyncio.Task[bool]] = {}
+        self._bootstrap_tasks_lock = asyncio.Lock()
 
     async def list_agents(self, user: AuthenticatedUser) -> list[CloudAgentConfig]:
-        root = self.workspace_manager.ensure_user_workspace(user.user_id)
-        try:
-            cfg = self.workspace_manager.load_workspace_config(root)
-            return [self.workspace_manager.load_agent_config(root, name) for name in sorted(cfg.agents)]
-        finally:
-            self.workspace_manager.cleanup_workspace(root)
+        agents = self.workspace_manager.list_agents_remote(user.user_id)
+        if agents is None:
+            await self._start_bootstrap_task(user.user_id)
+            return [self._default_agent()]
+        return agents
 
     async def ensure_agent(self, user: AuthenticatedUser, agent_name: str) -> CloudAgentConfig:
-        root = self.workspace_manager.ensure_user_workspace(user.user_id)
-        try:
-            cfg = self.workspace_manager.load_workspace_config(root)
-            if agent_name not in cfg.agents:
-                raise FileNotFoundError(agent_name)
-            return self.workspace_manager.load_agent_config(root, agent_name)
-        finally:
-            self.workspace_manager.cleanup_workspace(root)
+        return self.load_agent_metadata(user.user_id, agent_name)
 
     def _default_agent(self) -> CloudAgentConfig:
         return CloudAgentConfig(name="default")
@@ -391,6 +390,39 @@ class CloudRuntimeService:
         if agent is None:
             raise FileNotFoundError(agent_name)
         return agent
+
+    async def _start_bootstrap_task(self, user_id: str) -> asyncio.Task[bool] | None:
+        if self.workspace_manager.workspace_exists_remote(user_id):
+            return None
+        async with self._bootstrap_tasks_lock:
+            task = self._bootstrap_tasks.get(user_id)
+            if task is not None and not task.done():
+                return task
+            if self.workspace_manager.workspace_exists_remote(user_id):
+                return None
+            task = asyncio.create_task(asyncio.to_thread(self.workspace_manager.bootstrap_user_workspace, user_id))
+            self._bootstrap_tasks[user_id] = task
+            task.add_done_callback(lambda done, uid=user_id: self._on_bootstrap_done(uid, done))
+            return task
+
+    def _on_bootstrap_done(self, user_id: str, task: asyncio.Task[bool]) -> None:
+        current = self._bootstrap_tasks.get(user_id)
+        if current is task:
+            self._bootstrap_tasks.pop(user_id, None)
+        try:
+            task.result()
+        except Exception:
+            logger.exception("cloud bootstrap failed for user {}", user_id)
+
+    async def _ensure_bootstrapped(self, user_id: str) -> None:
+        if self.workspace_manager.workspace_exists_remote(user_id):
+            return
+        task = await self._start_bootstrap_task(user_id)
+        if task is not None:
+            await task
+        if self.workspace_manager.workspace_exists_remote(user_id):
+            return
+        await asyncio.to_thread(self.workspace_manager.bootstrap_user_workspace, user_id)
 
     def validate_skill_sources(self, user_id: str, agent_name: str, agent: CloudAgentConfig) -> None:
         for skill in agent.skills:
@@ -463,9 +495,10 @@ class CloudRuntimeService:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         on_tool_event: Callable[[dict[str, object]], Awaitable[None]] | None = None,
     ) -> CloudChatResult:
-        root = self.workspace_manager.ensure_user_workspace(user.user_id)
         if reservation is None:
             reservation = await self.reserve_chat_execution(user.user_id, agent_name, session_id)
+        await self._ensure_bootstrapped(user.user_id)
+        root = self.workspace_manager.ensure_user_workspace(user.user_id)
 
         runtime_dir: Path | None = None
         try:
@@ -501,6 +534,7 @@ class CloudRuntimeService:
                 on_tool_event=on_tool_event,
             )
             self.workspace_manager.persist_runtime_workspace(root, runtime_dir)
+            self.session_catalog.sync_session_from_root(root, user.user_id, agent_name, session_id)
             await self._persist_online_session(runtime_dir, session_key)
             cfg.updated_at = utc_now_iso()
             self.workspace_manager.save_workspace_config(root, cfg)
@@ -534,6 +568,160 @@ class CloudRuntimeService:
 
     def _lock_scope(self, user_id: str, agent_name: str, session_id: str) -> str:
         return f"chat:{user_id}:{agent_name}:{session_id}"
+
+    async def list_chat_sessions(self, user: AuthenticatedUser, agent_name: str) -> list[dict[str, Any]]:
+        self.load_agent_metadata(user.user_id, agent_name)
+        summaries = await asyncio.to_thread(
+            self.session_catalog.list_sessions_remote,
+            user.user_id,
+            agent_name,
+        )
+        return [item.to_dto() for item in summaries]
+
+    async def get_chat_session(
+        self,
+        user: AuthenticatedUser,
+        agent_name: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        self.load_agent_metadata(user.user_id, agent_name)
+        detail = await asyncio.to_thread(
+            self.session_catalog.get_session_detail_remote,
+            user.user_id,
+            agent_name,
+            session_id,
+        )
+        return detail.to_dto()
+
+    async def create_chat_session(
+        self,
+        user: AuthenticatedUser,
+        agent_name: str,
+    ) -> dict[str, Any]:
+        self.load_agent_metadata(user.user_id, agent_name)
+        await self._ensure_bootstrapped(user.user_id)
+        session_id = uuid.uuid4().hex
+        lock_scope = self._lock_scope(user.user_id, agent_name, session_id)
+        lock_token = await self.acquire_chat_lock(user.user_id, agent_name, session_id)
+        if lock_token is None:
+            raise CloudSessionLockedError(lock_scope)
+        root = self.workspace_manager.ensure_user_workspace(user.user_id)
+        try:
+            summary = await asyncio.to_thread(
+                self.session_catalog.create_session,
+                root,
+                user.user_id,
+                agent_name,
+                session_id,
+            )
+            cfg = self.workspace_manager.load_workspace_config(root)
+            cfg.updated_at = utc_now_iso()
+            self.workspace_manager.save_workspace_config(root, cfg)
+            self.workspace_manager.upload_user_workspace(user.user_id, root)
+            return summary.to_dto()
+        finally:
+            self.workspace_manager.cleanup_workspace(root)
+            await self.lock_manager.release(lock_scope, lock_token)
+
+    async def rename_chat_session(
+        self,
+        user: AuthenticatedUser,
+        agent_name: str,
+        session_id: str,
+        title: str,
+    ) -> dict[str, Any]:
+        self.load_agent_metadata(user.user_id, agent_name)
+        lock_scope = self._lock_scope(user.user_id, agent_name, session_id)
+        lock_token = await self.acquire_chat_lock(user.user_id, agent_name, session_id)
+        if lock_token is None:
+            raise CloudSessionLockedError(lock_scope)
+        root = self.workspace_manager.ensure_user_workspace(user.user_id)
+        try:
+            summary = await asyncio.to_thread(
+                self.session_catalog.rename_session,
+                root,
+                user.user_id,
+                agent_name,
+                session_id,
+                title,
+            )
+            cfg = self.workspace_manager.load_workspace_config(root)
+            cfg.updated_at = utc_now_iso()
+            self.workspace_manager.save_workspace_config(root, cfg)
+            self.workspace_manager.upload_user_workspace(user.user_id, root)
+            return summary.to_dto()
+        finally:
+            self.workspace_manager.cleanup_workspace(root)
+            await self.lock_manager.release(lock_scope, lock_token)
+
+    async def delete_chat_session(
+        self,
+        user: AuthenticatedUser,
+        agent_name: str,
+        session_id: str,
+    ) -> None:
+        self.load_agent_metadata(user.user_id, agent_name)
+        lock_scope = self._lock_scope(user.user_id, agent_name, session_id)
+        lock_token = await self.acquire_chat_lock(user.user_id, agent_name, session_id)
+        if lock_token is None:
+            raise CloudSessionLockedError(lock_scope)
+        root = self.workspace_manager.ensure_user_workspace(user.user_id)
+        try:
+            await asyncio.to_thread(
+                self.session_catalog.delete_session,
+                root,
+                user.user_id,
+                agent_name,
+                session_id,
+            )
+            cfg = self.workspace_manager.load_workspace_config(root)
+            cfg.updated_at = utc_now_iso()
+            self.workspace_manager.save_workspace_config(root, cfg)
+            self.workspace_manager.upload_user_workspace(user.user_id, root)
+            await self.session_store.delete(self._session_key(user.user_id, agent_name, session_id))
+        finally:
+            self.workspace_manager.cleanup_workspace(root)
+            await self.lock_manager.release(lock_scope, lock_token)
+
+    async def cleanup_empty_chat_session(
+        self,
+        user: AuthenticatedUser,
+        agent_name: str,
+        session_id: str,
+    ) -> bool:
+        self.load_agent_metadata(user.user_id, agent_name)
+        lock_scope = self._lock_scope(user.user_id, agent_name, session_id)
+        lock_token = await self.acquire_chat_lock(user.user_id, agent_name, session_id)
+        if lock_token is None:
+            return False
+        root = self.workspace_manager.ensure_user_workspace(user.user_id)
+        try:
+            has_user_turn = await asyncio.to_thread(
+                self.session_catalog.session_has_durable_user_turn,
+                user.user_id,
+                agent_name,
+                session_id,
+            )
+            if has_user_turn:
+                return False
+            await asyncio.to_thread(
+                self.session_catalog.delete_session,
+                root,
+                user.user_id,
+                agent_name,
+                session_id,
+            )
+            cfg = self.workspace_manager.load_workspace_config(root)
+            cfg.updated_at = utc_now_iso()
+            self.workspace_manager.save_workspace_config(root, cfg)
+            self.workspace_manager.upload_user_workspace(user.user_id, root)
+            await self.session_store.delete(self._session_key(user.user_id, agent_name, session_id))
+            return True
+        except FileNotFoundError:
+            return False
+        finally:
+            self.workspace_manager.cleanup_workspace(root)
+            await self.lock_manager.release(lock_scope, lock_token)
 
     async def _run_with_agent_loop(
         self,

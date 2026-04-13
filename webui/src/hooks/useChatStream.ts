@@ -1,7 +1,7 @@
 import { useCallback } from 'react';
 import { createChatStream, sendChatMessage } from '../api/chat';
 import { useChatStore } from '../stores/chatStore';
-import type { ChatRequest, MessageBlock } from '../types';
+import type { ChatRequest, MessageBlock, SessionDetailDTO } from '../types';
 
 function createMarkdownBlock(content: string): MessageBlock {
   return {
@@ -21,52 +21,65 @@ export function useChatStream() {
     adoptMessageId,
     setStreaming,
     getCurrentSession,
-  } =
-    useChatStore();
+    createSession,
+    discardSession,
+  } = useChatStore();
 
   const sendMessage = useCallback(
-    async (content: string, request: Omit<ChatRequest, 'messages'>) => {
-      const session = getCurrentSession();
-      if (!session) return;
+    async (content: string, request: Omit<ChatRequest, 'messages' | 'sessionId'>) => {
+      if (!request.agent) {
+        throw new Error('Agent is required');
+      }
 
-      // Add user message
-      addMessage(session.id, { role: 'user', blocks: [createMarkdownBlock(content)] });
+      let session: SessionDetailDTO | null = getCurrentSession();
+      const isBlankDraft = !session || session.agentId !== request.agent;
 
-      // Create placeholder for assistant and get the actual message id
-      const assistantMsgId = addMessage(session.id, { role: 'assistant', blocks: [] });
+      if (isBlankDraft) {
+        session = await createSession(request.agent);
+      }
+
+      const sessionId = session.id;
+
+      const rollbackBlankDraft = () => {
+        if (isBlankDraft) {
+          discardSession(sessionId);
+        }
+      };
+
+      addMessage(sessionId, { role: 'user', blocks: [createMarkdownBlock(content)] });
+      const assistantMsgId = addMessage(sessionId, { role: 'assistant', blocks: [] });
       let activeAssistantMsgId = assistantMsgId;
 
       setStreaming(true);
+
+      const payload: ChatRequest = {
+        ...request,
+        sessionId,
+        messages: [{ role: 'user', content }],
+      };
 
       const shouldStream = request.stream !== false;
 
       if (!shouldStream) {
         try {
-          const response = await sendChatMessage({
-            ...request,
-            messages: [
-              ...session.messages.map((m) => ({
-                role: m.role,
-                content: m.blocks
-                  .filter((block) => block.type === 'markdown')
-                  .map((block) => block.content)
-                  .join('\n'),
-              })),
-              { role: 'user', content },
-            ],
-          });
+          const response = await sendChatMessage(payload);
           if (response.message?.id && response.message.id !== activeAssistantMsgId) {
-            adoptMessageId(session.id, activeAssistantMsgId, response.message.id);
+            adoptMessageId(sessionId, activeAssistantMsgId, response.message.id);
             activeAssistantMsgId = response.message.id;
           }
           replaceAssistantBlocks(
-            session.id,
+            sessionId,
             activeAssistantMsgId,
             response.message?.blocks || [createMarkdownBlock(response.choices[0]?.message.content || '')]
           );
         } catch (err) {
+          if (isBlankDraft) {
+            rollbackBlankDraft();
+            throw err instanceof Error ? err : new Error('Unknown error');
+          }
+
           const message = err instanceof Error ? err.message : 'Unknown error';
-          replaceAssistantBlocks(session.id, activeAssistantMsgId, [
+          replaceAssistantBlocks(sessionId, activeAssistantMsgId, [
             createMarkdownBlock(`错误: ${message}`),
           ]);
         } finally {
@@ -75,54 +88,56 @@ export function useChatStream() {
         return;
       }
 
-      createChatStream(
-        {
-          ...request,
-          messages: [
-            ...session.messages.map((m) => ({
-              role: m.role,
-              content: m.blocks
-                .filter((block) => block.type === 'markdown')
-                .map((block) => block.content)
-                .join('\n'),
-            })),
-            { role: 'user', content },
-          ],
-        },
-        (event) => {
-          if (event.kind === 'text' && event.text) {
-            if (event.text.messageId && event.text.messageId !== activeAssistantMsgId) {
-              adoptMessageId(session.id, activeAssistantMsgId, event.text.messageId);
-              activeAssistantMsgId = event.text.messageId;
-            }
-            appendMarkdownDelta(session.id, activeAssistantMsgId, event.text);
-            return;
-          }
-          if (event.kind === 'tool' && event.tool) {
-            if (event.tool.message_id && event.tool.message_id !== activeAssistantMsgId) {
-              adoptMessageId(session.id, activeAssistantMsgId, event.tool.message_id);
-              activeAssistantMsgId = event.tool.message_id;
-            }
-            applyToolCallEvent(session.id, activeAssistantMsgId, event.tool);
-            return;
-          }
-          if (event.kind === 'error' && event.error) {
-            replaceAssistantBlocks(session.id, activeAssistantMsgId, [
-              createMarkdownBlock(`错误: ${event.error.message}`),
+      await new Promise<void>((resolve, reject) => {
+        let receivedServerActivity = false;
+
+        const fail = (error: Error) => {
+          if (isBlankDraft && !receivedServerActivity) {
+            rollbackBlankDraft();
+          } else {
+            replaceAssistantBlocks(sessionId, activeAssistantMsgId, [
+              createMarkdownBlock(`错误: ${error.message}`),
             ]);
           }
-        },
-        () => {
           setStreaming(false);
-        },
-        (err) => {
-          console.error('Chat error:', err);
-          replaceAssistantBlocks(session.id, activeAssistantMsgId, [
-            createMarkdownBlock(`错误: ${err.message}`),
-          ]);
-          setStreaming(false);
-        }
-      );
+          reject(error);
+        };
+
+        createChatStream(
+          payload,
+          (event) => {
+            if (event.kind === 'text' && event.text) {
+              receivedServerActivity = true;
+              if (event.text.messageId && event.text.messageId !== activeAssistantMsgId) {
+                adoptMessageId(sessionId, activeAssistantMsgId, event.text.messageId);
+                activeAssistantMsgId = event.text.messageId;
+              }
+              appendMarkdownDelta(sessionId, activeAssistantMsgId, event.text);
+              return;
+            }
+            if (event.kind === 'tool' && event.tool) {
+              receivedServerActivity = true;
+              if (event.tool.message_id && event.tool.message_id !== activeAssistantMsgId) {
+                adoptMessageId(sessionId, activeAssistantMsgId, event.tool.message_id);
+                activeAssistantMsgId = event.tool.message_id;
+              }
+              applyToolCallEvent(sessionId, activeAssistantMsgId, event.tool);
+              return;
+            }
+            if (event.kind === 'error' && event.error) {
+              fail(event.error);
+            }
+          },
+          () => {
+            setStreaming(false);
+            resolve();
+          },
+          (err) => {
+            console.error('Chat error:', err);
+            fail(err);
+          }
+        );
+      });
     },
     [
       addMessage,
@@ -132,6 +147,8 @@ export function useChatStream() {
       adoptMessageId,
       setStreaming,
       getCurrentSession,
+      createSession,
+      discardSession,
     ]
   );
 

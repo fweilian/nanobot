@@ -6,7 +6,7 @@ import { useChatStore } from '../../stores/chatStore';
 export function AgentSelector() {
   const { agents, selectedAgent, loading, error, loadAgents, selectAgent } =
     useAgentStore();
-  const { createSession } = useChatStore();
+  const { clearAgentSelection, loadSessionsForAgent } = useChatStore();
 
   useEffect(() => {
     loadAgents();
@@ -16,11 +16,12 @@ export function AgentSelector() {
     const agentId = e.target.value;
     if (agentId === '') {
       selectAgent(null);
+      clearAgentSelection();
     } else {
       const agent = agents.find((a) => a.id === agentId);
       if (agent) {
         selectAgent(agent);
-        createSession(agent.id);
+        void loadSessionsForAgent(agent.id);
       }
     }
   };

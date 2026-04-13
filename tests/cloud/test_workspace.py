@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from pathlib import Path
 
 import pytest
 
 from nanobot.cloud.auth import AuthenticatedUser
-from nanobot.cloud.config import ManagedProviderView, SkillCacheSettings
+from nanobot.cloud.config import CloudAgentConfig, ManagedProviderView, SkillCacheSettings
 from nanobot.cloud.runtime import CloudChatResult, CloudRuntimeService, CloudWorkspaceManager
 from nanobot.cloud.session_store import InMemorySessionStore, session_file_path
 from nanobot.cloud.skills_cache import InMemorySkillBundleStore
@@ -30,6 +32,40 @@ def test_first_login_bootstraps_workspace(tmp_path: Path):
         assert "default" in config.agents
         assert agent.name == "default"
         assert (root / "memory" / "MEMORY.md").exists()
+    finally:
+        manager.cleanup_workspace(root)
+
+
+def test_upload_user_workspace_publishes_workspace_config_last_and_cleans_stale_keys(tmp_path: Path):
+    store = MemoryStore()
+    manager = CloudWorkspaceManager(
+        store=store,
+        cache_root=tmp_path,
+        workspace_prefix="workspaces",
+        platform_provider=ManagedProviderView(provider="openrouter", model="openai/gpt-4.1"),
+    )
+
+    root = manager.ensure_user_workspace("alice")
+    try:
+        cfg = manager.load_workspace_config(root)
+        cfg.agents["research"] = "agents/research/config.json"
+        manager.save_workspace_config(root, cfg)
+        manager.save_agent_config(root, CloudAgentConfig(name="research"))
+        stale_key = "workspaces/alice/stale.txt"
+        store.put_bytes(stale_key, b"old")
+        store.operations.clear()
+
+        manager.upload_user_workspace("alice", root)
+
+        ops = store.operations
+        config_key = manager.workspace_config_key("alice")
+        put_indices = [i for i, (op, key) in enumerate(ops) if op == "put" and key == config_key]
+        delete_indices = [i for i, (op, key) in enumerate(ops) if op == "delete" and key == stale_key]
+
+        assert put_indices
+        assert delete_indices
+        assert put_indices[-1] < delete_indices[0]
+        assert stale_key not in store.data
     finally:
         manager.cleanup_workspace(root)
 
@@ -305,6 +341,103 @@ async def test_multi_instance_flow_reuses_online_session(tmp_path: Path):
 
     assert observed_contents[0] == ""
     assert "hello" in observed_contents[1]
+
+
+@pytest.mark.asyncio
+async def test_run_chat_waits_for_inflight_bootstrap_task(tmp_path: Path, monkeypatch):
+    store = MemoryStore()
+    session_store = InMemorySessionStore()
+    lock_manager = InMemoryLockManager()
+    settings_path = tmp_path / "platform.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "providers": {"openrouter": {"apiKey": "sk-test"}},
+                "agents": {"defaults": {"model": "openai/gpt-4.1"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def executor(
+        root,
+        runtime_dir,
+        builtin_dir,
+        selected_skills_dir,
+        *,
+        user,
+        agent,
+        session_key,
+        content,
+        message_id=None,
+        on_stream=None,
+        on_stream_end=None,
+        on_tool_event=None,
+    ):
+        return CloudChatResult(content=f"reply:{content}", model="openai/gpt-4.1")
+
+    settings = type(
+        "Settings",
+        (),
+        {
+            "request_timeout": 30,
+            "redis": type("RedisCfg", (), {"lock_ttl_s": 30})(),
+            "skill_cache": SkillCacheSettings(),
+        },
+    )()
+    manager = CloudWorkspaceManager(
+        store=store,
+        cache_root=tmp_path / "cache",
+        workspace_prefix="workspaces",
+        platform_provider=ManagedProviderView(provider="openrouter", model="openai/gpt-4.1"),
+    )
+    service = CloudRuntimeService(
+        settings=settings,
+        workspace_manager=manager,
+        platform_config_path=settings_path,
+        session_store=session_store,
+        lock_manager=lock_manager,
+        skill_bundle_store=InMemorySkillBundleStore(),
+        executor=executor,
+    )
+    user = AuthenticatedUser(user_id="alice", claims={"sub": "alice"}, token="t")
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+    original = manager.bootstrap_user_workspace
+
+    def slow_bootstrap(user_id: str) -> bool:
+        nonlocal calls
+        calls += 1
+        started.set()
+        release.wait(timeout=2)
+        return original(user_id)
+
+    monkeypatch.setattr(manager, "bootstrap_user_workspace", slow_bootstrap)
+
+    agents = await service.list_agents(user)
+    assert [agent.name for agent in agents] == ["default"]
+    assert await asyncio.to_thread(started.wait, 1)
+
+    reservation = await service.reserve_chat_execution("alice", "default", "thread-1")
+    chat_task = asyncio.create_task(
+        service.run_chat(
+            user=user,
+            agent_name="default",
+            session_id="thread-1",
+            content="hello",
+            reservation=reservation,
+        )
+    )
+
+    await asyncio.sleep(0.05)
+    assert not chat_task.done()
+    release.set()
+    result = await chat_task
+
+    assert result.content == "reply:hello"
+    assert calls == 1
 
 
 def shutil_rmtree(path: Path) -> None:

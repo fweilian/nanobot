@@ -41,13 +41,22 @@ export interface Message {
   createdAt: number;
 }
 
-export interface Session {
+export interface SessionSummaryDTO {
   id: string;
   agentId: string;
   title: string;
-  messages: Message[];
   createdAt: number;
   updatedAt: number;
+}
+
+export interface SessionDetailDTO extends SessionSummaryDTO {
+  messages: Message[];
+}
+
+export interface CreateSessionResponse extends SessionSummaryDTO {}
+
+export interface RenameSessionRequest {
+  title: string;
 }
 
 export interface ChatRequest {
@@ -55,6 +64,7 @@ export interface ChatRequest {
   messages: Array<{ role: string; content: string }>;
   stream?: boolean;
   agent?: string;
+  sessionId?: string;
 }
 
 export interface AssistantMessagePayload {

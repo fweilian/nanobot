@@ -8,7 +8,7 @@ export function ChatInput() {
   const [input, setInput] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { selectedAgent } = useAgentStore();
-  const { streaming } = useChatStore();
+  const { sessionLoading, streaming } = useChatStore();
   const { sendMessage } = useChatStream();
 
   useEffect(() => {
@@ -18,16 +18,24 @@ export function ChatInput() {
     }
   }, [input]);
 
+  useEffect(() => {
+    setInput('');
+  }, [selectedAgent?.id]);
+
   const handleSubmit = async () => {
-    if (!input.trim() || !selectedAgent || streaming) return;
+    if (!input.trim() || !selectedAgent || streaming || sessionLoading) return;
 
     const content = input.trim();
     setInput('');
 
-    await sendMessage(content, {
-      agent: selectedAgent.id,
-      model: selectedAgent.model,
-    });
+    try {
+      await sendMessage(content, {
+        agent: selectedAgent.id,
+        model: selectedAgent.model,
+      });
+    } catch {
+      setInput(content);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -58,11 +66,11 @@ export function ChatInput() {
           placeholder="输入消息... (Shift+Enter 换行)"
           className="flex-1 resize-none rounded-lg border border-gray-300 dark:border-gray-600 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:bg-gray-800 dark:text-white"
           rows={1}
-          disabled={streaming}
+          disabled={streaming || sessionLoading}
         />
         <button
           onClick={handleSubmit}
-          disabled={!input.trim() || streaming}
+          disabled={!input.trim() || streaming || sessionLoading}
           className="p-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <Send size={20} />

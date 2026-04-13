@@ -16,6 +16,14 @@ type OpenAIChunkLike = {
   }>;
 };
 
+function serializeChatRequest(request: ChatRequest) {
+  const { sessionId, ...rest } = request;
+  return {
+    ...rest,
+    ...(sessionId ? { session_id: sessionId } : {}),
+  };
+}
+
 export function parseChatStreamData(data: string): ParsedChatStreamEvent | null {
   if (data === '[DONE]') {
     return { kind: 'done' };
@@ -67,7 +75,7 @@ export function parseChatStreamData(data: string): ParsedChatStreamEvent | null 
 export async function sendChatMessage(request: ChatRequest): Promise<ChatResponse> {
   return apiRequest<ChatResponse>('/v1/chat/completions', {
     method: 'POST',
-    body: JSON.stringify(request),
+    body: JSON.stringify(serializeChatRequest(request)),
   });
 }
 
@@ -94,7 +102,7 @@ export function createChatStream(
   fetch(`${apiUrl}/v1/chat/completions`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ ...request, stream: true }),
+    body: JSON.stringify({ ...serializeChatRequest(request), stream: true }),
     signal: controller.signal,
   })
     .then(async (response) => {
