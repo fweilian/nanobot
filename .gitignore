@@ -33,6 +33,7 @@ build/
 *.spec
 pip-wheel-metadata/
 share/python-wheels/
+webui/node_modules/
 
 # Test & coverage
 .coverage
@@ -84,3 +85,6 @@ logs/
 tmp/
 temp/
 *.tmp
+.omx/
+.codex/
+.nanobot-cloud/
