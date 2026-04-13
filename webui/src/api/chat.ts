@@ -17,10 +17,13 @@ type OpenAIChunkLike = {
 };
 
 function serializeChatRequest(request: ChatRequest) {
-  const { sessionId, ...rest } = request;
+  const { sessionId, cleanupEmptySessionOnError, ...rest } = request;
   return {
     ...rest,
     ...(sessionId ? { session_id: sessionId } : {}),
+    ...(cleanupEmptySessionOnError
+      ? { cleanup_empty_session_on_error: cleanupEmptySessionOnError }
+      : {}),
   };
 }
 

@@ -128,6 +128,7 @@ describe('useChatStream', () => {
       agent: 'agent-1',
       model: 'test-model',
       sessionId: 'session-1',
+      cleanupEmptySessionOnError: true,
       stream: false,
       messages: [{ role: 'user', content: 'hello' }],
     });
@@ -146,5 +147,36 @@ describe('useChatStream', () => {
         sequence: 0,
       },
     ]);
+  });
+
+  it('rolls back a blank-draft session when the first send fails', async () => {
+    mockCreateSession.mockResolvedValue({
+      id: 'session-rollback',
+      agentId: 'agent-1',
+      title: '新对话',
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    mockSendChatMessage.mockRejectedValue(new Error('boom'));
+
+    useChatStore.getState().startBlankDraft('agent-1');
+
+    let caught: unknown;
+    await act(async () => {
+      try {
+        await sendMessage('hello', {
+          agent: 'agent-1',
+          model: 'test-model',
+          stream: false,
+        });
+      } catch (err) {
+        caught = err;
+      }
+    });
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toBe('boom');
+    expect(useChatStore.getState().currentSession).toBeNull();
+    expect(useChatStore.getState().sessions).toEqual([]);
   });
 });

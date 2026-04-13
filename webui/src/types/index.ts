@@ -65,6 +65,7 @@ export interface ChatRequest {
   stream?: boolean;
   agent?: string;
   sessionId?: string;
+  cleanupEmptySessionOnError?: boolean;
 }
 
 export interface AssistantMessagePayload {

@@ -55,6 +55,7 @@ export function useChatStream() {
       const payload: ChatRequest = {
         ...request,
         sessionId,
+        cleanupEmptySessionOnError: isBlankDraft,
         messages: [{ role: 'user', content }],
       };
 
@@ -89,10 +90,8 @@ export function useChatStream() {
       }
 
       await new Promise<void>((resolve, reject) => {
-        let receivedServerActivity = false;
-
         const fail = (error: Error) => {
-          if (isBlankDraft && !receivedServerActivity) {
+          if (isBlankDraft) {
             rollbackBlankDraft();
           } else {
             replaceAssistantBlocks(sessionId, activeAssistantMsgId, [
@@ -107,7 +106,6 @@ export function useChatStream() {
           payload,
           (event) => {
             if (event.kind === 'text' && event.text) {
-              receivedServerActivity = true;
               if (event.text.messageId && event.text.messageId !== activeAssistantMsgId) {
                 adoptMessageId(sessionId, activeAssistantMsgId, event.text.messageId);
                 activeAssistantMsgId = event.text.messageId;
@@ -116,7 +114,6 @@ export function useChatStream() {
               return;
             }
             if (event.kind === 'tool' && event.tool) {
-              receivedServerActivity = true;
               if (event.tool.message_id && event.tool.message_id !== activeAssistantMsgId) {
                 adoptMessageId(sessionId, activeAssistantMsgId, event.tool.message_id);
                 activeAssistantMsgId = event.tool.message_id;

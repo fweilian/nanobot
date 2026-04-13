@@ -643,6 +643,8 @@ class LLMProvider(ABC):
         retry_mode: str,
         on_retry_wait: Callable[[str], Awaitable[None]] | None,
     ) -> LLMResponse:
+        print(self.api_base)
+        print(self.api_key)
         attempt = 0
         delays = list(self._CHAT_RETRY_DELAYS)
         persistent = retry_mode == "persistent"

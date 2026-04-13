@@ -6,6 +6,13 @@ import secrets
 import time
 from typing import Protocol
 
+from loguru import logger
+
+try:
+    from redis.exceptions import RedisError
+except Exception:  # pragma: no cover - redis is an optional runtime dependency for import time
+    RedisError = Exception
+
 
 class CloudSessionLockedError(RuntimeError):
     """Raised when a write session is already being processed elsewhere."""
@@ -62,14 +69,33 @@ class RedisDistributedLockManager:
     def __init__(self, client, *, key_prefix: str) -> None:
         self._client = client
         self._key_prefix = key_prefix.rstrip(":")
+        self._fallback = InMemoryDistributedLockManager()
+        self._degraded = False
 
     def _key(self, scope: str) -> str:
         return f"{self._key_prefix}:lock:{scope}"
 
+    def _mark_degraded(self, exc: Exception) -> None:
+        if self._degraded:
+            return
+        self._degraded = True
+        logger.warning(
+            "Redis lock manager unavailable; falling back to in-memory locks for this process: {}",
+            exc,
+        )
+
     async def acquire(self, scope: str, ttl_s: int) -> str | None:
-        token = secrets.token_urlsafe(16)
-        acquired = await self._client.set(self._key(scope), token, nx=True, ex=ttl_s)
-        return token if acquired else None
+        try:
+            token = secrets.token_urlsafe(16)
+            acquired = await self._client.set(self._key(scope), token, nx=True, ex=ttl_s)
+            return token if acquired else None
+        except (RedisError, OSError) as exc:
+            self._mark_degraded(exc)
+            return await self._fallback.acquire(scope, ttl_s)
 
     async def release(self, scope: str, token: str) -> None:
-        await self._client.eval(self._RELEASE_SCRIPT, 1, self._key(scope), token)
+        try:
+            await self._client.eval(self._RELEASE_SCRIPT, 1, self._key(scope), token)
+        except (RedisError, OSError) as exc:
+            self._mark_degraded(exc)
+            await self._fallback.release(scope, token)

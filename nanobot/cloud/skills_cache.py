@@ -10,7 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
+from loguru import logger
 from pydantic import BaseModel, Field
+
+try:
+    from redis.exceptions import RedisError
+except Exception:  # pragma: no cover - redis is optional at import time
+    RedisError = Exception
 
 
 class SkillBundleManifest(BaseModel):
@@ -85,31 +91,50 @@ class RedisSkillBundleStore:
         self._client = client
         self._key_prefix = key_prefix.rstrip(":")
         self._ttl_s = ttl_s
+        self._fallback = InMemorySkillBundleStore()
+        self._degraded = False
 
     def _key(self, bundle_hash: str) -> str:
         return f"{self._key_prefix}:skill-bundle:{bundle_hash}"
 
+    def _mark_degraded(self, exc: Exception) -> None:
+        if self._degraded:
+            return
+        self._degraded = True
+        logger.warning(
+            "Redis skill bundle cache unavailable; falling back to in-memory cache for this process: {}",
+            exc,
+        )
+
     async def get(self, bundle_hash: str) -> dict[str, bytes] | None:
-        payload = await self._client.get(self._key(bundle_hash))
-        if payload is None:
-            return None
-        raw = payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
-        data = json.loads(raw)
-        return {
-            path: base64.b64decode(content.encode("ascii"))
-            for path, content in data.items()
-        }
+        try:
+            payload = await self._client.get(self._key(bundle_hash))
+            if payload is None:
+                return None
+            raw = payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
+            data = json.loads(raw)
+            return {
+                path: base64.b64decode(content.encode("ascii"))
+                for path, content in data.items()
+            }
+        except (RedisError, OSError) as exc:
+            self._mark_degraded(exc)
+            return await self._fallback.get(bundle_hash)
 
     async def put(self, bundle_hash: str, files: dict[str, bytes]) -> None:
-        data = {
-            path: base64.b64encode(content).decode("ascii")
-            for path, content in files.items()
-        }
-        await self._client.set(
-            self._key(bundle_hash),
-            json.dumps(data, ensure_ascii=False).encode("utf-8"),
-            ex=self._ttl_s,
-        )
+        try:
+            data = {
+                path: base64.b64encode(content).decode("ascii")
+                for path, content in files.items()
+            }
+            await self._client.set(
+                self._key(bundle_hash),
+                json.dumps(data, ensure_ascii=False).encode("utf-8"),
+                ex=self._ttl_s,
+            )
+        except (RedisError, OSError) as exc:
+            self._mark_degraded(exc)
+            await self._fallback.put(bundle_hash, files)
 
 
 class SkillStageBudgetManager:

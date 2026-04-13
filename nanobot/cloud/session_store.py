@@ -5,6 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
+from loguru import logger
+
+try:
+    from redis.exceptions import RedisError
+except Exception:  # pragma: no cover - redis is optional at import time
+    RedisError = Exception
+
 from nanobot.utils.helpers import safe_filename
 
 
@@ -51,16 +58,39 @@ class RedisSessionStore:
         self._client = client
         self._key_prefix = key_prefix.rstrip(":")
         self._ttl_s = ttl_s
+        self._fallback = InMemorySessionStore()
+        self._degraded = False
 
     def _key(self, session_key: str) -> str:
         return f"{self._key_prefix}:session:{session_key}"
 
+    def _mark_degraded(self, exc: Exception) -> None:
+        if self._degraded:
+            return
+        self._degraded = True
+        logger.warning(
+            "Redis session store unavailable; falling back to in-memory online sessions for this process: {}",
+            exc,
+        )
+
     async def load(self, session_key: str) -> bytes | None:
-        data = await self._client.get(self._key(session_key))
-        return data if data is None or isinstance(data, bytes) else str(data).encode("utf-8")
+        try:
+            data = await self._client.get(self._key(session_key))
+            return data if data is None or isinstance(data, bytes) else str(data).encode("utf-8")
+        except (RedisError, OSError) as exc:
+            self._mark_degraded(exc)
+            return await self._fallback.load(session_key)
 
     async def save(self, session_key: str, data: bytes) -> None:
-        await self._client.set(self._key(session_key), data, ex=self._ttl_s)
+        try:
+            await self._client.set(self._key(session_key), data, ex=self._ttl_s)
+        except (RedisError, OSError) as exc:
+            self._mark_degraded(exc)
+            await self._fallback.save(session_key, data)
 
     async def delete(self, session_key: str) -> None:
-        await self._client.delete(self._key(session_key))
+        try:
+            await self._client.delete(self._key(session_key))
+        except (RedisError, OSError) as exc:
+            self._mark_degraded(exc)
+            await self._fallback.delete(session_key)
