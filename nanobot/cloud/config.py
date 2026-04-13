@@ -10,6 +10,18 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def encrypt_data(data: str) -> str:
+    """Encrypt secret data for storage in .env."""
+    # TODO: implement encryption (e.g., Fernet, AWS KMS, etc.)
+    return data
+
+
+def decrypt_data(data: str) -> str:
+    """Decrypt secret data from .env."""
+    # TODO: implement decryption
+    return data
+
+
 def utc_now_iso() -> str:
     """Return an ISO8601 UTC timestamp."""
     return datetime.now(timezone.utc).isoformat()
