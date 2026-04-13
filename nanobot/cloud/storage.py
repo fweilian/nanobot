@@ -20,6 +20,8 @@ class ObjectStore(Protocol):
 
     def put_bytes(self, key: str, data: bytes) -> None: ...
 
+    def delete_keys(self, keys: list[str]) -> None: ...
+
     def delete_prefix(self, prefix: str) -> None: ...
 
 
@@ -82,8 +84,7 @@ class S3ObjectStore:
     def put_bytes(self, key: str, data: bytes) -> None:
         self._client.put_object(Bucket=self.bucket, Key=self._full_key(key), Body=data)
 
-    def delete_prefix(self, prefix: str) -> None:
-        keys = self.list_keys(prefix)
+    def delete_keys(self, keys: list[str]) -> None:
         if not keys:
             return
         full_keys = [{"Key": self._full_key(key)} for key in keys]
@@ -92,6 +93,10 @@ class S3ObjectStore:
                 Bucket=self.bucket,
                 Delete={"Objects": full_keys[start:start + 1000], "Quiet": True},
             )
+
+    def delete_prefix(self, prefix: str) -> None:
+        keys = self.list_keys(prefix)
+        self.delete_keys(keys)
 
 
 def download_prefix(store: ObjectStore, prefix: str, destination: Path) -> None:

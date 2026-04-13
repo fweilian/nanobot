@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from nanobot.cloud.auth import AuthenticatedUser
 from nanobot.cloud.config import (
     AuthSettings,
+    CloudAgentConfig,
     CloudServiceSettings,
     ManagedProviderView,
     RedisSettings,
@@ -17,6 +19,7 @@ from nanobot.cloud.runtime import CloudChatResult, CloudRuntimeService, CloudWor
 from nanobot.cloud.server import create_app
 from nanobot.cloud.session_store import session_file_path
 from nanobot.cloud.skills_cache import SkillStageBudgetExceededError
+from nanobot.session.manager import SessionManager
 from tests.cloud.support import InMemoryLockManager, InMemorySessionStore, MemoryStore
 
 
@@ -75,10 +78,11 @@ def app(settings: CloudServiceSettings):
         on_stream_end=None,
         on_tool_event=None,
     ):
-        path = session_file_path(runtime_dir, session_key)
-        existing = path.read_text(encoding="utf-8") if path.exists() else ""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(existing + content, encoding="utf-8")
+        manager = SessionManager(runtime_dir)
+        session = manager.get_or_create(session_key)
+        session.add_message("user", content)
+        session.add_message("assistant", f"reply:{content}")
+        manager.save(session)
         if on_tool_event:
             await on_tool_event(
                 {
@@ -147,6 +151,166 @@ def test_agents_bootstrap_and_chat(client):
     assert any(block["type"] == "tool_call" for block in body["message"]["blocks"])
 
 
+def test_session_crud_round_trip(client):
+    created = client.post(
+        "/v1/agents/default/sessions",
+        headers={"Authorization": "Bearer token"},
+    )
+    assert created.status_code == 200
+    payload = created.json()
+    session_id = payload["id"]
+    assert payload["agentId"] == "default"
+    assert payload["title"] == "新对话"
+
+    listed = client.get(
+        "/v1/agents/default/sessions",
+        headers={"Authorization": "Bearer token"},
+    )
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()["data"]] == [session_id]
+
+    detail = client.get(
+        f"/v1/agents/default/sessions/{session_id}",
+        headers={"Authorization": "Bearer token"},
+    )
+    assert detail.status_code == 200
+    assert detail.json()["messages"] == []
+
+    renamed = client.patch(
+        f"/v1/agents/default/sessions/{session_id}",
+        headers={"Authorization": "Bearer token"},
+        json={"title": "Renamed session"},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["title"] == "Renamed session"
+
+    detail = client.get(
+        f"/v1/agents/default/sessions/{session_id}",
+        headers={"Authorization": "Bearer token"},
+    )
+    assert detail.status_code == 200
+    assert detail.json()["title"] == "Renamed session"
+
+    deleted = client.delete(
+        f"/v1/agents/default/sessions/{session_id}",
+        headers={"Authorization": "Bearer token"},
+    )
+    assert deleted.status_code == 204
+
+    listed = client.get(
+        "/v1/agents/default/sessions",
+        headers={"Authorization": "Bearer token"},
+    )
+    assert listed.status_code == 200
+    assert listed.json()["data"] == []
+
+    missing = client.get(
+        f"/v1/agents/default/sessions/{session_id}",
+        headers={"Authorization": "Bearer token"},
+    )
+    assert missing.status_code == 404
+
+
+def test_agents_listing_uses_remote_metadata_without_workspace_checkout(client, monkeypatch):
+    runtime_service = client.app.state.runtime_service
+    manager = runtime_service.workspace_manager
+    root = manager.ensure_user_workspace("alice")
+    try:
+        cfg = manager.load_workspace_config(root)
+        cfg.agents["research"] = "agents/research/config.json"
+        manager.save_workspace_config(root, cfg)
+        manager.save_agent_config(root, CloudAgentConfig(name="research", description="Research agent"))
+        manager.upload_user_workspace("alice", root)
+    finally:
+        manager.cleanup_workspace(root)
+
+    def fail(user_id: str):
+        raise AssertionError(f"workspace checkout should not be used for listing: {user_id}")
+
+    monkeypatch.setattr(manager, "ensure_user_workspace", fail)
+
+    resp = client.get("/v1/agents", headers={"Authorization": "Bearer token"})
+
+    assert resp.status_code == 200
+    assert [agent["id"] for agent in resp.json()["data"]] == ["default", "research"]
+
+
+def test_session_listing_uses_manifest_without_workspace_checkout(client, monkeypatch):
+    created = client.post(
+        "/v1/agents/default/sessions",
+        headers={"Authorization": "Bearer token"},
+    )
+    assert created.status_code == 200
+    session_id = created.json()["id"]
+
+    runtime_service = client.app.state.runtime_service
+    manager = runtime_service.workspace_manager
+
+    def fail(user_id: str):
+        raise AssertionError(f"workspace checkout should not be used for session listing: {user_id}")
+
+    monkeypatch.setattr(manager, "ensure_user_workspace", fail)
+
+    listed = client.get(
+        "/v1/agents/default/sessions",
+        headers={"Authorization": "Bearer token"},
+    )
+
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()["data"]] == [session_id]
+
+
+def test_agents_listing_for_new_user_returns_default_before_bootstrap_finishes(client, monkeypatch):
+    runtime_service = client.app.state.runtime_service
+    manager = runtime_service.workspace_manager
+    config_key = manager.workspace_config_key("alice")
+
+    def fail(user_id: str):
+        raise AssertionError(f"workspace checkout should not be used for listing: {user_id}")
+
+    monkeypatch.setattr(manager, "ensure_user_workspace", fail)
+
+    resp = client.get("/v1/agents", headers={"Authorization": "Bearer token"})
+
+    assert resp.status_code == 200
+    assert resp.json()["data"][0]["id"] == "default"
+    for _ in range(100):
+        if manager.store.exists(config_key):
+            break
+        time.sleep(0.01)
+    assert manager.store.exists(config_key)
+
+
+def test_session_detail_returns_history_after_chat(client):
+    created = client.post(
+        "/v1/agents/default/sessions",
+        headers={"Authorization": "Bearer token"},
+    )
+    session_id = created.json()["id"]
+
+    chat = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer token"},
+        json={
+            "agent": "default",
+            "session_id": session_id,
+            "messages": [{"role": "user", "content": "hello from history"}],
+        },
+    )
+    assert chat.status_code == 200
+
+    detail = client.get(
+        f"/v1/agents/default/sessions/{session_id}",
+        headers={"Authorization": "Bearer token"},
+    )
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["title"].startswith("hello from history")
+    assert [message["role"] for message in payload["messages"]] == ["user", "assistant"]
+    assert payload["messages"][0]["blocks"][0]["content"] == "hello from history"
+    assert payload["messages"][1]["blocks"][0]["type"] == "markdown"
+
+
 def test_streaming_chat_returns_sse(client):
     resp = client.post(
         "/v1/chat/completions",
@@ -161,6 +325,87 @@ def test_streaming_chat_returns_sse(client):
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
     assert "data: [DONE]" in resp.text
+
+
+def test_streaming_first_send_failure_cleans_up_empty_session(client, monkeypatch):
+    created = client.post(
+        "/v1/agents/default/sessions",
+        headers={"Authorization": "Bearer token"},
+    )
+    session_id = created.json()["id"]
+    runtime_service = client.app.state.runtime_service
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runtime_service, "_executor", fail)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer token"},
+        json={
+            "agent": "default",
+            "session_id": session_id,
+            "cleanup_empty_session_on_error": True,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert resp.status_code == 200
+    assert "server_error" in resp.text
+
+    listed = client.get(
+        "/v1/agents/default/sessions",
+        headers={"Authorization": "Bearer token"},
+    )
+    assert listed.status_code == 200
+    assert listed.json()["data"] == []
+
+
+def test_streaming_failure_keeps_session_if_user_turn_is_already_durable(client, monkeypatch):
+    created = client.post(
+        "/v1/agents/default/sessions",
+        headers={"Authorization": "Bearer token"},
+    )
+    session_id = created.json()["id"]
+    runtime_service = client.app.state.runtime_service
+    manager = runtime_service.workspace_manager
+    root = manager.ensure_user_workspace("alice")
+    try:
+        session_manager = SessionManager(root)
+        session = session_manager.get_or_create(f"cloud:alice:default:{session_id}")
+        session.add_message("user", "already durable")
+        session.metadata["title"] = "already durable"
+        session_manager.save(session)
+        manager.upload_user_workspace("alice", root)
+    finally:
+        manager.cleanup_workspace(root)
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runtime_service, "_executor", fail)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer token"},
+        json={
+            "agent": "default",
+            "session_id": session_id,
+            "cleanup_empty_session_on_error": True,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert resp.status_code == 200
+    assert "server_error" in resp.text
+
+    listed = client.get(
+        "/v1/agents/default/sessions",
+        headers={"Authorization": "Bearer token"},
+    )
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()["data"]] == [session_id]
 
 
 def test_streaming_chat_includes_tool_call_events(client):

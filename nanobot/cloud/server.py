@@ -44,8 +44,13 @@ class ChatCompletionsRequest(BaseModel):
     model: str | None = None
     agent: str = "default"
     session_id: str = "default"
+    cleanup_empty_session_on_error: bool = False
     stream: bool = False
     messages: list[ChatMessage] = Field(default_factory=list)
+
+
+class RenameSessionRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
 
 
 def _last_user_text(messages: list[ChatMessage]) -> str:
@@ -367,6 +372,75 @@ def create_app(
             ],
         }
 
+    @app.get("/v1/agents/{agent_name}/sessions")
+    async def list_sessions(
+        agent_name: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        entries = await request.app.state.runtime_service.list_chat_sessions(user, agent_name)
+        return {"object": "list", "data": entries}
+
+    @app.post("/v1/agents/{agent_name}/sessions")
+    async def create_session(
+        agent_name: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return await request.app.state.runtime_service.create_chat_session(user, agent_name)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except CloudSessionLockedError:
+            return _session_locked_response()
+
+    @app.get("/v1/agents/{agent_name}/sessions/{session_id}")
+    async def get_session(
+        agent_name: str,
+        session_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return await request.app.state.runtime_service.get_chat_session(user, agent_name, session_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    @app.patch("/v1/agents/{agent_name}/sessions/{session_id}")
+    async def rename_session(
+        agent_name: str,
+        session_id: str,
+        body: RenameSessionRequest,
+        request: Request,
+        user: AuthenticatedUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return await request.app.state.runtime_service.rename_chat_session(
+                user,
+                agent_name,
+                session_id,
+                body.title.strip(),
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except CloudSessionLockedError:
+            return _session_locked_response()
+
+    @app.delete("/v1/agents/{agent_name}/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+    async def delete_session(
+        agent_name: str,
+        session_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(current_user),
+    ) -> JSONResponse:
+        try:
+            await request.app.state.runtime_service.delete_chat_session(user, agent_name, session_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except CloudSessionLockedError:
+            return _session_locked_response()
+        return JSONResponse(status_code=status.HTTP_204_NO_CONTENT, content=None)
+
     @app.post("/v1/chat/completions")
     async def chat_completions(
         body: ChatCompletionsRequest,
@@ -443,6 +517,10 @@ def create_app(
                 return _skill_stage_budget_response(exc)
             except FileNotFoundError as exc:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+            except Exception:
+                if body.cleanup_empty_session_on_error:
+                    await service.cleanup_empty_chat_session(user, body.agent, body.session_id)
+                raise
             payload = _completion_response(result.content, result.model)
             payload["message"] = {
                 "id": message_id,
@@ -516,6 +594,8 @@ def create_app(
                             yield "data: [DONE]\n\n"
                             break
                         except Exception:
+                            if body.cleanup_empty_session_on_error:
+                                await service.cleanup_empty_chat_session(user, body.agent, body.session_id)
                             yield _sse_error("server_error", "Streaming execution failed.", retryable=False)
                             yield "data: [DONE]\n\n"
                             break
@@ -553,6 +633,8 @@ def create_app(
                         yield "data: [DONE]\n\n"
                         break
                     except Exception:
+                        if body.cleanup_empty_session_on_error:
+                            await service.cleanup_empty_chat_session(user, body.agent, body.session_id)
                         yield _sse_error("server_error", "Streaming execution failed.", retryable=False)
                         yield "data: [DONE]\n\n"
                         break
@@ -565,6 +647,8 @@ def create_app(
                 raise
             except Exception:
                 task.cancel()
+                if body.cleanup_empty_session_on_error:
+                    await service.cleanup_empty_chat_session(user, body.agent, body.session_id)
                 raise
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")

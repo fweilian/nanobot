@@ -8,6 +8,7 @@ class MemoryStore:
 
     def __init__(self):
         self.data: dict[str, bytes] = {}
+        self.operations: list[tuple[str, str]] = []
 
     def exists(self, key: str) -> bool:
         return key in self.data
@@ -28,12 +29,17 @@ class MemoryStore:
         return self.data[key]
 
     def put_bytes(self, key: str, data: bytes) -> None:
+        self.operations.append(("put", key))
         self.data[key] = data
+
+    def delete_keys(self, keys: list[str]) -> None:
+        for key in keys:
+            self.operations.append(("delete", key))
+            self.data.pop(key, None)
 
     def delete_prefix(self, prefix: str) -> None:
         normalized = prefix.rstrip("/") + "/"
-        for key in [key for key in self.data if key.startswith(normalized)]:
-            del self.data[key]
+        self.delete_keys([key for key in self.data if key.startswith(normalized)])
 
 
 class InMemorySessionStore:
