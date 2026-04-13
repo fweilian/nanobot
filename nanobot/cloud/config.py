@@ -82,6 +82,7 @@ class RedisSettings(BaseModel):
     """Redis settings for stateless multi-instance cloud mode."""
 
     url: str = "redis://127.0.0.1:6379/0"
+    mode: Literal["single", "cluster", "auto"] = "single"
     key_prefix: str = "nanobot-cloud"
     session_ttl_s: int = 24 * 60 * 60
     lock_ttl_s: int = 5 * 60

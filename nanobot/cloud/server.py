@@ -20,6 +20,7 @@ from nanobot.cloud.auth import (
 )
 from nanobot.cloud.config import CloudServiceSettings, ManagedProviderView
 from nanobot.cloud.lock import CloudSessionLockedError, RedisDistributedLockManager
+from nanobot.cloud.redis_client import create_redis_client
 from nanobot.cloud.runtime import CloudRuntimeService, CloudWorkspaceManager
 from nanobot.cloud.session_store import RedisSessionStore
 from nanobot.cloud.skills_cache import (
@@ -225,15 +226,13 @@ def _reduce_blocks_from_events(
 
 def build_runtime_service(settings: CloudServiceSettings) -> CloudRuntimeService:
     """Build the main cloud runtime service from settings."""
-    from redis.asyncio import Redis
-
     platform_config = resolve_config_env_vars(load_config(settings.nanobot_config_path))
     provider_name = platform_config.get_provider_name(platform_config.agents.defaults.model) or "managed"
     provider_view = ManagedProviderView(
         provider=provider_name,
         model=platform_config.agents.defaults.model,
     )
-    redis_client = Redis.from_url(settings.redis.url, encoding="utf-8", decode_responses=False)
+    redis_client = create_redis_client(settings.redis)
     workspace_manager = CloudWorkspaceManager(
         store=S3ObjectStore(
             bucket=settings.s3.bucket,

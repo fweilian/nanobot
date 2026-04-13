@@ -29,6 +29,7 @@ See [`.env.example`](../.env.example) for the full list.
 - `NANOBOT_CLOUD_REQUEST_TIMEOUT`
 - `NANOBOT_CLOUD_WORKSPACE_PREFIX`
 - `NANOBOT_CLOUD_REDIS__URL`
+- `NANOBOT_CLOUD_REDIS__MODE`
 - `NANOBOT_CLOUD_REDIS__KEY_PREFIX`
 - `NANOBOT_CLOUD_REDIS__SESSION_TTL_S`
 - `NANOBOT_CLOUD_REDIS__LOCK_TTL_S`
@@ -269,6 +270,18 @@ For local MinIO development, set:
 For stateless multi-instance development, also set:
 
 - `NANOBOT_CLOUD_REDIS__URL`
+- `NANOBOT_CLOUD_REDIS__MODE`
+
+Redis mode values:
+
+- `single` - standalone Redis / sentinel-routed single endpoint
+- `cluster` - Redis Cluster via `RedisCluster.from_url(...)`
+- `auto` - treat `redis+cluster://...` or `?cluster=true` URLs as cluster, otherwise standalone
+
+Password note:
+
+- passwords that contain `@` are accepted in raw form and normalized before connect
+- percent-encoded form such as `%40` is still recommended for portability
 
 ## Real E2E Validation
 
@@ -376,6 +389,7 @@ export NANOBOT_CLOUD_REQUEST_TIMEOUT=60
 export NANOBOT_CLOUD_WORKSPACE_PREFIX=workspaces
 
 export NANOBOT_CLOUD_REDIS__URL='redis://:123456@127.0.0.1:6379/0'
+export NANOBOT_CLOUD_REDIS__MODE='single'
 export NANOBOT_CLOUD_REDIS__KEY_PREFIX='nanobot-cloud-e2e:e2e-manual-1775971831-588c77'
 export NANOBOT_CLOUD_REDIS__SESSION_TTL_S=3600
 export NANOBOT_CLOUD_REDIS__LOCK_TTL_S=120
