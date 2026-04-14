@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import shutil
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 
 class ObjectStore(Protocol):
@@ -25,6 +27,58 @@ class ObjectStore(Protocol):
     def delete_prefix(self, prefix: str) -> None: ...
 
 
+def _content_md5_header(data: bytes) -> str:
+    digest = hashlib.md5(data, usedforsecurity=False).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _request_body_bytes(body: Any) -> bytes:
+    if body is None:
+        return b""
+    if isinstance(body, bytes):
+        return body
+    if isinstance(body, str):
+        return body.encode("utf-8")
+    if isinstance(body, bytearray):
+        return bytes(body)
+    if isinstance(body, memoryview):
+        return body.tobytes()
+    if hasattr(body, "read"):
+        position = body.tell() if hasattr(body, "tell") else None
+        data = body.read()
+        if position is not None and hasattr(body, "seek"):
+            body.seek(position)
+        return _request_body_bytes(data)
+    return bytes(body)
+
+
+def _ensure_delete_objects_content_md5(request: Any, **_: Any) -> None:
+    headers = getattr(request, "headers", None)
+    if headers is None or "Content-MD5" in headers:
+        return
+    headers["Content-MD5"] = _content_md5_header(_request_body_bytes(getattr(request, "body", None)))
+
+
+def create_s3_client(
+    *,
+    endpoint_url: str | None = None,
+    region_name: str | None = None,
+    access_key_id: str | None = None,
+    secret_access_key: str | None = None,
+):
+    import boto3
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        region_name=region_name,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+    )
+    client.meta.events.register("before-sign.s3.DeleteObjects", _ensure_delete_objects_content_md5)
+    return client
+
+
 class S3ObjectStore:
     """S3-compatible object store backed by boto3."""
 
@@ -38,16 +92,13 @@ class S3ObjectStore:
         access_key_id: str | None = None,
         secret_access_key: str | None = None,
     ) -> None:
-        import boto3
-
         self.bucket = bucket
         self.prefix = prefix.strip("/")
-        self._client = boto3.client(
-            "s3",
+        self._client = create_s3_client(
             endpoint_url=endpoint_url,
             region_name=region_name,
-            aws_access_key_id=access_key_id,
-            aws_secret_access_key=secret_access_key,
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
         )
 
     def _full_key(self, key: str) -> str:

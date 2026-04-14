@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -431,14 +431,14 @@ def create_app(
         session_id: str,
         request: Request,
         user: AuthenticatedUser = Depends(current_user),
-    ) -> JSONResponse:
+    ) -> Response:
         try:
             await request.app.state.runtime_service.delete_chat_session(user, agent_name, session_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         except CloudSessionLockedError:
             return _session_locked_response()
-        return JSONResponse(status_code=status.HTTP_204_NO_CONTENT, content=None)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(

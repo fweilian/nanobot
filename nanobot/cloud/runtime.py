@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+import platform
 
 from loguru import logger
 
@@ -22,6 +23,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.cloud.auth import AuthenticatedUser
 from nanobot.cloud.config import CloudAgentConfig, utc_now_iso
 from nanobot.cloud.lock import CloudSessionLockedError
+from nanobot.cloud.session_sanitize import sanitize_session_payload_for_persist
 from nanobot.cloud.session_catalog import CloudSessionCatalog
 from nanobot.cloud.session_store import OnlineSessionStore, session_file_path
 from nanobot.cloud.skills_cache import (
@@ -68,6 +70,29 @@ class CloudContextBuilder(ContextBuilder):
         self.skills = SkillsLoader(workspace, builtin_skills_dir=builtin_skills_dir)
         self.skills.workspace_skills = selected_skills_dir
 
+    def _get_identity(self, channel: str | None = None) -> str:
+        from nanobot.utils.prompt_templates import render_template
+
+        system = platform.system()
+        runtime = (
+            f"{'macOS' if system == 'Darwin' else system} "
+            f"{platform.machine()}, Python {platform.python_version()}"
+        )
+        base = render_template(
+            "agent/identity.md",
+            workspace_path=".",
+            runtime=runtime,
+            platform_policy=render_template("agent/platform_policy.md", system=system),
+            channel=channel or "",
+        )
+        return (
+            base
+            + "\n\n## Cloud Workspace Rules\n"
+            + "- Treat the current workspace root as `.`.\n"
+            + "- Use relative paths for file tools whenever possible; do not rely on absolute temp paths.\n"
+            + "- Stable memory files live at `USER.md`, `SOUL.md`, and `memory/MEMORY.md`.\n"
+        )
+
 
 class CloudSubagentManager(SubagentManager):
     """Subagent manager with a scoped builtin skills directory."""
@@ -93,7 +118,7 @@ class CloudSubagentManager(SubagentManager):
         return render_template(
             "agent/subagent_system.md",
             time_ctx=time_ctx,
-            workspace=str(self.workspace),
+            workspace=".",
             skills_summary=skills_summary or "",
         )
 
@@ -284,7 +309,7 @@ class CloudWorkspaceManager(RequestWorkspaceManager):
         )
         return runtime_dir, selected_builtin_dir, selected_skills_dir, total_skill_bytes
 
-    def persist_runtime_workspace(self, root: Path, runtime_dir: Path) -> None:
+    def persist_runtime_workspace(self, root: Path, runtime_dir: Path, agent_name: str | None = None) -> None:
         transient = {".cloud_builtin_skills", ".cloud_selected_skills", ".git"}
 
         def _is_skill_path(relative: Path) -> bool:
@@ -332,6 +357,81 @@ class CloudWorkspaceManager(RequestWorkspaceManager):
                 if staged.exists():
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copytree(staged, target)
+
+        self._persist_created_runtime_skills(root, runtime_dir)
+        self._sync_agent_skill_declarations(root, agent_name)
+
+    def _persist_created_runtime_skills(self, root: Path, runtime_dir: Path) -> None:
+        """Persist skills that were created directly in the request runtime workspace."""
+
+        def _copy_entry(source: Path, target: Path) -> None:
+            if source.is_dir():
+                if target.exists() and target.is_file():
+                    target.unlink()
+                target.mkdir(parents=True, exist_ok=True)
+                for child in source.iterdir():
+                    _copy_entry(child, target / child.name)
+                return
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+        candidate_roots = [runtime_dir / "skills"]
+        agents_dir = runtime_dir / "agents"
+        if agents_dir.exists():
+            candidate_roots.extend(path for path in agents_dir.glob("*/skills"))
+
+        for skill_root in candidate_roots:
+            if not skill_root.exists():
+                continue
+            for entry in skill_root.iterdir():
+                target = root / entry.relative_to(runtime_dir)
+                _copy_entry(entry, target)
+
+    def _sync_agent_skill_declarations(self, root: Path, agent_name: str | None = None) -> None:
+        """Register persisted custom skills on the current agent."""
+
+        workspace_cfg = self.load_workspace_config(root)
+        target_agent_name = agent_name or workspace_cfg.default_agent
+        if target_agent_name not in workspace_cfg.agents:
+            return
+
+        agent = self.load_agent_config(root, target_agent_name)
+        workspace_skill_names = self._skill_names(root / "skills")
+        agent_skill_names = self._skill_names(root / "agents" / target_agent_name / "skills")
+        custom_skill_names = workspace_skill_names | agent_skill_names
+
+        updated_skills: list[str] = []
+        seen: set[str] = set()
+        for skill in agent.skills:
+            if skill in seen:
+                continue
+            if (BUILTIN_SKILLS_DIR / skill).exists() or skill in custom_skill_names:
+                updated_skills.append(skill)
+                seen.add(skill)
+
+        for skill in sorted(custom_skill_names):
+            if skill in seen:
+                continue
+            updated_skills.append(skill)
+            seen.add(skill)
+
+        if updated_skills == agent.skills:
+            return
+
+        agent.skills = updated_skills
+        agent.updated_at = utc_now_iso()
+        self.save_agent_config(root, agent)
+
+    @staticmethod
+    def _skill_names(base: Path) -> set[str]:
+        if not base.exists():
+            return set()
+        names: set[str] = set()
+        for skill_dir in base.iterdir():
+            if skill_dir.is_dir() and (skill_dir / "SKILL.md").exists():
+                names.add(skill_dir.name)
+        return names
 
 
 class CloudRuntimeService:
@@ -533,7 +633,7 @@ class CloudRuntimeService:
                 on_stream_end=on_stream_end,
                 on_tool_event=on_tool_event,
             )
-            self.workspace_manager.persist_runtime_workspace(root, runtime_dir)
+            self.workspace_manager.persist_runtime_workspace(root, runtime_dir, agent.name)
             self.session_catalog.sync_session_from_root(root, user.user_id, agent_name, session_id)
             await self._persist_online_session(runtime_dir, session_key)
             cfg.updated_at = utc_now_iso()
@@ -561,7 +661,8 @@ class CloudRuntimeService:
         if not path.exists():
             await self.session_store.delete(session_key)
             return
-        await self.session_store.save(session_key, path.read_bytes())
+        payload = sanitize_session_payload_for_persist(path.read_bytes(), runtime_dir)
+        await self.session_store.save(session_key, payload)
 
     def _session_key(self, user_id: str, agent_name: str, session_id: str) -> str:
         return f"cloud:{user_id}:{agent_name}:{session_id}"
@@ -788,6 +889,7 @@ class CloudRuntimeService:
         config = deepcopy(self.platform_config)
         defaults = config.agents.defaults
         defaults.workspace = str(runtime_dir)
+        config.tools.restrict_to_workspace = True
         for field in (
             "temperature",
             "max_tokens",

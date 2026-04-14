@@ -196,6 +196,7 @@ def test_session_crud_round_trip(client):
         headers={"Authorization": "Bearer token"},
     )
     assert deleted.status_code == 204
+    assert deleted.content == b""
 
     listed = client.get(
         "/v1/agents/default/sessions",

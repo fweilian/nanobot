@@ -14,11 +14,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-import boto3
 import httpx
 import jwt
 import uvicorn
 
+from nanobot.cloud.storage import create_s3_client
 from nanobot.cloud.server import create_app
 
 
@@ -95,12 +95,11 @@ def build_env(args: argparse.Namespace, cache_dir: Path, shared_secret: str) -> 
 
 
 def s3_client(args: argparse.Namespace):
-    return boto3.client(
-        "s3",
+    return create_s3_client(
         endpoint_url=args.s3_endpoint_url,
         region_name=args.s3_region_name,
-        aws_access_key_id=args.s3_access_key_id,
-        aws_secret_access_key=args.s3_secret_access_key,
+        access_key_id=args.s3_access_key_id,
+        secret_access_key=args.s3_secret_access_key,
     )
 
 
