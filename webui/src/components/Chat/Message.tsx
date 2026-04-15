@@ -1,8 +1,9 @@
 import { ChevronDown, ChevronRight, Wrench } from 'lucide-react';
 import type { ComponentPropsWithoutRef } from 'react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { useConfigStore } from '../../stores/configStore';
 import type { Message, MessageBlock, ToolCallBlock } from '../../types';
 
 interface MessageProps {
@@ -11,6 +12,91 @@ interface MessageProps {
 
 function isSafeHref(href?: string) {
   return !!href && /^(https?:|mailto:)/i.test(href);
+}
+
+function isProtectedMediaSrc(src?: string) {
+  if (!src) {
+    return false;
+  }
+  return /^\/v1\/media\//.test(src) || /\/v1\/media\//.test(src);
+}
+
+function resolveApiUrl(apiUrl: string, src: string) {
+  if (/^https?:\/\//i.test(src)) {
+    return src;
+  }
+  const base = apiUrl.replace(/\/$/, '');
+  const path = src.startsWith('/') ? src : `/${src}`;
+  return `${base}${path}`;
+}
+
+function AuthenticatedImage({
+  src,
+  alt,
+  ...props
+}: ComponentPropsWithoutRef<'img'>) {
+  const { apiUrl, apiKey } = useConfigStore();
+  const [resolvedSrc, setResolvedSrc] = useState<string | undefined>(undefined);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    if (!src) {
+      setResolvedSrc(undefined);
+      return;
+    }
+
+    if (!isProtectedMediaSrc(src)) {
+      setResolvedSrc(src);
+      return;
+    }
+
+    let active = true;
+    let objectUrl: string | null = null;
+
+    const fetchProtectedMedia = async () => {
+      try {
+        const target = resolveApiUrl(apiUrl, src);
+        const headers = new Headers();
+        if (apiKey) {
+          headers.set('Authorization', `Bearer ${apiKey}`);
+        }
+        const response = await fetch(target, { headers });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const blob = await response.blob();
+        objectUrl = URL.createObjectURL(blob);
+        if (active) {
+          setResolvedSrc(objectUrl);
+          setError(false);
+        }
+      } catch {
+        if (active) {
+          setResolvedSrc(undefined);
+          setError(true);
+        }
+      }
+    };
+
+    void fetchProtectedMedia();
+
+    return () => {
+      active = false;
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [apiKey, apiUrl, src]);
+
+  if (error) {
+    return <span className="text-sm text-red-500">[image failed to load]</span>;
+  }
+
+  if (!resolvedSrc) {
+    return <span className="text-sm text-gray-500">[loading image]</span>;
+  }
+
+  return <img {...props} src={resolvedSrc} alt={alt} className="max-w-full rounded-lg" />;
 }
 
 function MarkdownBlock({ block, isUser }: { block: Extract<MessageBlock, { type: 'markdown' }>; isUser: boolean }) {
@@ -49,6 +135,7 @@ function MarkdownBlock({ block, isUser }: { block: Extract<MessageBlock, { type:
         components={{
           a: Link,
           code: InlineCode,
+          img: AuthenticatedImage,
           pre: Pre,
         }}
       >

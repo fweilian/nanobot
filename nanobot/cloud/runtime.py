@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import platform
 import shutil
 import tempfile
 import uuid
@@ -11,7 +12,6 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-import platform
 
 from loguru import logger
 
@@ -21,10 +21,12 @@ from nanobot.agent.skills import BUILTIN_SKILLS_DIR, SkillsLoader
 from nanobot.agent.subagent import SubagentManager
 from nanobot.bus.queue import MessageBus
 from nanobot.cloud.auth import AuthenticatedUser
+from nanobot.cloud.browser_orchestrator import BrowserOrchestrator
+from nanobot.cloud.browser_store import BrowserStore
 from nanobot.cloud.config import CloudAgentConfig, utc_now_iso
 from nanobot.cloud.lock import CloudSessionLockedError
-from nanobot.cloud.session_sanitize import sanitize_session_payload_for_persist
 from nanobot.cloud.session_catalog import CloudSessionCatalog
+from nanobot.cloud.session_sanitize import sanitize_session_payload_for_persist
 from nanobot.cloud.session_store import OnlineSessionStore, session_file_path
 from nanobot.cloud.skills_cache import (
     PreparedSkillBundle,
@@ -157,6 +159,13 @@ class CloudAgentLoop(AgentLoop):
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
+        from nanobot.agent.tools.browser import (
+            BrowserCloseTool,
+            BrowserContinueTool,
+            BrowserExtractTool,
+            BrowserLoginTool,
+            BrowserOpenTool,
+        )
         from nanobot.agent.tools.cron import CronTool
         from nanobot.agent.tools.filesystem import (
             EditFileTool,
@@ -201,6 +210,15 @@ class CloudAgentLoop(AgentLoop):
             self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
+        if self.browser_orchestrator and self.browser_store:
+            for cls in (
+                BrowserOpenTool,
+                BrowserLoginTool,
+                BrowserContinueTool,
+                BrowserExtractTool,
+                BrowserCloseTool,
+            ):
+                self.tools.register(cls(self.browser_orchestrator, self.browser_store))
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
@@ -445,6 +463,8 @@ class CloudRuntimeService:
         platform_config_path: Path,
         session_store: OnlineSessionStore,
         lock_manager,
+        browser_store: BrowserStore | None = None,
+        browser_orchestrator: BrowserOrchestrator | None = None,
         skill_bundle_store: SkillBundleContentStore | None = None,
         skill_stage_budget: SkillStageBudgetManager | None = None,
         executor: Callable[..., Awaitable[CloudChatResult]] | None = None,
@@ -459,6 +479,8 @@ class CloudRuntimeService:
         self.session_store = session_store
         self.session_catalog = CloudSessionCatalog(workspace_manager, session_store)
         self.lock_manager = lock_manager
+        self.browser_store = browser_store
+        self.browser_orchestrator = browser_orchestrator
         self.skill_bundle_store = skill_bundle_store
         self.skill_stage_budget = skill_stage_budget
         self._executor = executor or self._run_with_agent_loop
@@ -861,6 +883,8 @@ class CloudRuntimeService:
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
             session_ttl_minutes=defaults.session_ttl_minutes,
+            browser_orchestrator=self.browser_orchestrator,
+            browser_store=self.browser_store,
             builtin_skills_dir=builtin_dir,
             selected_skills_dir=selected_skills_dir,
         )

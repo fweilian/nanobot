@@ -109,6 +109,18 @@ class SkillCacheSettings(BaseModel):
     redis_content_ttl_s: int = 24 * 60 * 60
 
 
+class BrowserSettings(BaseModel):
+    """Browser control-plane settings."""
+
+    enabled: bool = True
+    key_prefix: str = "browser"
+    auth_ttl_s: int = 60 * 60
+    task_ttl_s: int = 15 * 60
+    qr_ttl_s: int = 2 * 60
+    media_ttl_s: int = 3 * 60
+    shm_root: str = "/dev/shm/nanobot-browser"
+
+
 class CloudServiceSettings(BaseSettings):
     """Service settings loaded from .env / environment."""
 
@@ -128,6 +140,7 @@ class CloudServiceSettings(BaseSettings):
     auth: AuthSettings
     redis: RedisSettings = Field(default_factory=RedisSettings)
     skill_cache: SkillCacheSettings = Field(default_factory=SkillCacheSettings)
+    browser: BrowserSettings = Field(default_factory=BrowserSettings)
     s3: S3Settings
 
     @property

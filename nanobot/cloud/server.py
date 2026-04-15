@@ -18,6 +18,8 @@ from nanobot.cloud.auth import (
     TokenVerifier,
     resolve_bearer_token,
 )
+from nanobot.cloud.browser_orchestrator import BrowserOrchestrator
+from nanobot.cloud.browser_store import RedisBrowserStore
 from nanobot.cloud.config import CloudServiceSettings, ManagedProviderView
 from nanobot.cloud.lock import CloudSessionLockedError, RedisDistributedLockManager
 from nanobot.cloud.redis_client import create_redis_client
@@ -233,6 +235,14 @@ def build_runtime_service(settings: CloudServiceSettings) -> CloudRuntimeService
         model=platform_config.agents.defaults.model,
     )
     redis_client = create_redis_client(settings.redis)
+    browser_prefix = f"{settings.redis.key_prefix}:{settings.browser.key_prefix}"
+    browser_store = RedisBrowserStore(redis_client, key_prefix=browser_prefix)
+    browser_orchestrator = BrowserOrchestrator(
+        browser_store,
+        event_stream=browser_store.keys.event_stream,
+        auth_ttl_s=settings.browser.auth_ttl_s,
+        task_ttl_s=settings.browser.task_ttl_s,
+    )
     workspace_manager = CloudWorkspaceManager(
         store=S3ObjectStore(
             bucket=settings.s3.bucket,
@@ -259,6 +269,8 @@ def build_runtime_service(settings: CloudServiceSettings) -> CloudRuntimeService
             redis_client,
             key_prefix=settings.redis.key_prefix,
         ),
+        browser_store=browser_store,
+        browser_orchestrator=browser_orchestrator,
         skill_bundle_store=RedisSkillBundleStore(
             redis_client,
             key_prefix=settings.redis.key_prefix,
@@ -404,6 +416,26 @@ def create_app(
             return await request.app.state.runtime_service.get_chat_session(user, agent_name, session_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    @app.get("/v1/media/{media_id}")
+    async def get_media(
+        media_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(current_user),
+    ) -> Response:
+        store = request.app.state.runtime_service.browser_store
+        if store is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="browser media unavailable")
+        media = await store.load_media(media_id)
+        if media is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="media not found")
+        if media.get("owner_user_id") != user.user_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="media not found")
+        return Response(
+            content=media["bytes"],
+            media_type=str(media.get("content_type") or "application/octet-stream"),
+            headers={"Content-Disposition": f'inline; filename="{media.get("filename") or media_id}"'},
+        )
 
     @app.patch("/v1/agents/{agent_name}/sessions/{session_id}")
     async def rename_session(

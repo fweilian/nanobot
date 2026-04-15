@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from nanobot.cloud.auth import AuthenticatedUser
+from nanobot.cloud.browser_orchestrator import BrowserOrchestrator
+from nanobot.cloud.browser_store import InMemoryBrowserStore
 from nanobot.cloud.config import (
     AuthSettings,
     CloudAgentConfig,
@@ -17,7 +19,6 @@ from nanobot.cloud.config import (
 )
 from nanobot.cloud.runtime import CloudChatResult, CloudRuntimeService, CloudWorkspaceManager
 from nanobot.cloud.server import create_app
-from nanobot.cloud.session_store import session_file_path
 from nanobot.cloud.skills_cache import SkillStageBudgetExceededError
 from nanobot.session.manager import SessionManager
 from tests.cloud.support import InMemoryLockManager, InMemorySessionStore, MemoryStore
@@ -56,6 +57,13 @@ def app(settings: CloudServiceSettings):
     store = MemoryStore()
     session_store = InMemorySessionStore()
     lock_manager = InMemoryLockManager()
+    browser_store = InMemoryBrowserStore(key_prefix="test-cloud:browser")
+    browser_orchestrator = BrowserOrchestrator(
+        browser_store,
+        event_stream=browser_store.keys.event_stream,
+        auth_ttl_s=settings.browser.auth_ttl_s,
+        task_ttl_s=settings.browser.task_ttl_s,
+    )
     workspace_manager = CloudWorkspaceManager(
         store=store,
         cache_root=settings.cache_root,
@@ -114,6 +122,8 @@ def app(settings: CloudServiceSettings):
         platform_config_path=settings.nanobot_config_path,
         session_store=session_store,
         lock_manager=lock_manager,
+        browser_store=browser_store,
+        browser_orchestrator=browser_orchestrator,
         executor=executor,
     )
     return create_app(runtime_service=runtime_service, token_verifier=StubVerifier(), settings=settings)
@@ -127,6 +137,31 @@ def test_health_and_models(client):
     models = client.get("/v1/models")
     assert models.status_code == 200
     assert models.json()["data"][0]["id"] == "openai/gpt-4.1"
+
+
+def test_media_endpoint_requires_owner_and_returns_bytes(client):
+    runtime_service = client.app.state.runtime_service
+    store = runtime_service.browser_store
+    assert store is not None
+
+    import asyncio
+
+    asyncio.run(
+        store.save_media(
+            "media-test",
+            data=b"png-bytes",
+            content_type="image/png",
+            filename="qr.png",
+            owner_user_id="alice",
+            browser_session_id="cloud:alice:default:s1:browser",
+            ttl_s=60,
+        )
+    )
+
+    resp = client.get("/v1/media/media-test", headers={"Authorization": "Bearer token"})
+    assert resp.status_code == 200
+    assert resp.content == b"png-bytes"
+    assert resp.headers["content-type"].startswith("image/png")
 
 
 def test_agents_bootstrap_and_chat(client):
